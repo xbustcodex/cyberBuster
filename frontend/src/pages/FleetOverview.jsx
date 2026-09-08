@@ -3,7 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { api } from "@/lib/api";
 import { FLEET } from "@/constants/testIds";
 import { useCli } from "@/components/Layout";
-import { Search, RefreshCw, Filter, Terminal } from "lucide-react";
+import { Search, RefreshCw, Filter, Terminal, Radar } from "lucide-react";
 import { toast } from "sonner";
 
 const PROFILE_META = {
@@ -61,6 +61,19 @@ export default function FleetOverview() {
     } catch { toast.error("Switch failed"); }
   };
 
+  const [sweeping, setSweeping] = useState(false);
+  const bulkSweep = async () => {
+    setSweeping(true);
+    try {
+      const { data } = await api.post("/ioc/bulk-sweep", { scope: "online" });
+      const providers = Object.entries(data.providers_used || {}).filter(([, v]) => v).map(([k]) => k).join("+");
+      toast.success(`Swept ${data.hosts_swept} host(s) · ${data.total_lookups} lookups via ${providers || "no providers"}`);
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Bulk sweep failed — is VirusTotal or Shodan enabled?");
+    }
+    setSweeping(false);
+  };
+
   return (
     <div className="space-y-4">
       <header className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
@@ -75,6 +88,14 @@ export default function FleetOverview() {
         </div>
         <div className="flex gap-2">
           <button
+            data-testid="fleet-bulk-sweep-btn"
+            onClick={bulkSweep} disabled={sweeping}
+            className="flex items-center gap-1.5 px-3 py-1.5 border rounded-sm text-xs font-mono hover:bg-[#292e42] disabled:opacity-60"
+            style={{ borderColor: "var(--purple-analyst)", color: "var(--purple-analyst)" }}
+          >
+            <Radar size={12} className={sweeping ? "animate-spin" : ""} /> {sweeping ? "sweeping…" : "bulk-sweep IOCs"}
+          </button>
+          <button
             onClick={load}
             className="flex items-center gap-1.5 px-3 py-1.5 border rounded-sm text-xs font-mono hover:bg-[#292e42]"
             style={{ borderColor: "var(--border-subtle)" }}
@@ -82,7 +103,7 @@ export default function FleetOverview() {
           <button
             onClick={() => openCli({
               title: "List all fleet workstations",
-              command: "sec-master fleet list --profile all --format table",
+              command: "sec-master fleet list --profile all --format table\nsec-master ioc bulk-sweep --scope online",
               description: "Runs against the fleet daemon API, prints hostname/profile/status/tool-count.",
             })}
             className="flex items-center gap-1.5 px-3 py-1.5 border rounded-sm text-xs font-mono hover:bg-[#292e42]"

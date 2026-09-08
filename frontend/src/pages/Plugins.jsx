@@ -3,7 +3,7 @@ import { api } from "@/lib/api";
 import { PLUGINS } from "@/constants/testIds";
 import { useCli } from "@/components/Layout";
 import {
-  Plug, Plus, RefreshCw, Play, Trash2, Pencil, Bookmark, Sparkles,
+  Plug, Plus, RefreshCw, Play, Trash2, Pencil, Bookmark, Sparkles, Users,
   CheckCircle2, XCircle, Terminal, ChevronDown, X, Search,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -19,12 +19,14 @@ const CATEGORY_COLOR = {
 function SaveTemplateModal({ open, plugin, onClose, onSaved }) {
   const [name, setName] = useState("");
   const [includeSecrets, setIncludeSecrets] = useState(false);
+  const [shared, setShared] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (open && plugin) {
       setName(`${plugin.name} template`);
       setIncludeSecrets(false);
+      setShared(false);
     }
   }, [open, plugin]);
 
@@ -34,8 +36,10 @@ function SaveTemplateModal({ open, plugin, onClose, onSaved }) {
     if (!name.trim()) { toast.error("Name required"); return; }
     setBusy(true);
     try {
-      await api.post(`/plugins/${plugin.id}/save-as-template`, { name: name.trim(), include_secrets: includeSecrets });
-      toast.success(`Template "${name}" saved`);
+      await api.post(`/plugins/${plugin.id}/save-as-template`, {
+        name: name.trim(), include_secrets: includeSecrets, shared,
+      });
+      toast.success(`Template "${name}" saved${shared ? " · team-shared" : ""}`);
       onSaved(); onClose();
     } catch (e) { toast.error(e.response?.data?.detail || "Save failed"); }
     setBusy(false);
@@ -66,6 +70,15 @@ function SaveTemplateModal({ open, plugin, onClose, onSaved }) {
             <span className="text-[#c0caf5]">include encrypted secrets</span>
             <span className="block text-[10px] text-[#565f89] leading-relaxed">
               secrets stay encrypted at rest · anyone with dashboard access can spawn a working copy · leave off for public templates
+            </span>
+          </span>
+        </label>
+        <label className="flex items-start gap-2 text-xs font-mono cursor-pointer">
+          <input data-testid="template-save-shared" type="checkbox" checked={shared} onChange={(e) => setShared(e.target.checked)} className="mt-0.5" />
+          <span>
+            <span className="text-[#c0caf5]">share with team</span>
+            <span className="block text-[10px] text-[#565f89] leading-relaxed">
+              pins template to the top of the library so new operators find it on day one
             </span>
           </span>
         </label>
@@ -400,6 +413,14 @@ export default function Plugins() {
     catch { toast.error("delete failed"); }
   };
 
+  const toggleShared = async (t) => {
+    try {
+      await api.patch(`/plugin-templates/${t.id}`, { shared: !t.shared });
+      toast.success(t.shared ? "unshared from team" : "shared with team");
+      load();
+    } catch { toast.error("update failed"); }
+  };
+
   return (
     <div className="space-y-4">
       <header className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
@@ -520,13 +541,23 @@ export default function Plugins() {
               const type = catalog.find((c) => c.kind === t.type);
               const cat = type?.category || "custom";
               return (
-                <article key={t.id} data-testid="template-card" className="border rounded-sm p-3 flex flex-col gap-2"
-                  style={{ borderColor: "var(--border-subtle)", background: "var(--bg-terminal)" }}>
+                <article key={t.id} data-testid="template-card"
+                  className={`border rounded-sm p-3 flex flex-col gap-2 ${t.shared ? "ring-1" : ""}`}
+                  style={{
+                    borderColor: t.shared ? "var(--purple-analyst)" : "var(--border-subtle)",
+                    background: "var(--bg-terminal)",
+                  }}>
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
                         <Sparkles size={12} style={{ color: CATEGORY_COLOR[cat] }} />
                         <div className="font-mono text-sm text-[#c0caf5] truncate">{t.name}</div>
+                        {t.shared && (
+                          <span className="inline-flex items-center gap-0.5 px-1 py-0.5 border rounded-sm uppercase tracking-widest text-[9px]"
+                            style={{ borderColor: "var(--purple-analyst)", color: "var(--purple-analyst)" }}>
+                            <Users size={9} /> team
+                          </span>
+                        )}
                       </div>
                       <div className="mt-1 flex items-center gap-2 text-[10px] font-mono">
                         <span className="uppercase tracking-widest" style={{ color: CATEGORY_COLOR[cat] }}>{t.type}</span>
@@ -534,10 +565,18 @@ export default function Plugins() {
                           style={{ borderColor: "var(--purple-analyst)", color: "var(--purple-analyst)" }}>with secrets</span>}
                       </div>
                     </div>
-                    <button onClick={() => deleteTemplate(t)} className="p-1 border rounded-sm hover:bg-[#292e42]"
-                      style={{ borderColor: "var(--border-subtle)", color: "var(--sev-high)" }}>
-                      <Trash2 size={10} />
-                    </button>
+                    <div className="flex flex-col gap-1">
+                      <button data-testid="template-share-toggle" onClick={() => toggleShared(t)}
+                        title={t.shared ? "un-share from team" : "share with team"}
+                        className="p-1 border rounded-sm hover:bg-[#292e42]"
+                        style={{ borderColor: "var(--border-subtle)", color: t.shared ? "var(--purple-analyst)" : "var(--text-secondary)" }}>
+                        <Users size={10} />
+                      </button>
+                      <button onClick={() => deleteTemplate(t)} className="p-1 border rounded-sm hover:bg-[#292e42]"
+                        style={{ borderColor: "var(--border-subtle)", color: "var(--sev-high)" }}>
+                        <Trash2 size={10} />
+                      </button>
+                    </div>
                   </div>
                   <div className="text-[10px] font-mono text-[#565f89]">
                     events: {t.event_subscriptions?.length ? t.event_subscriptions.join(", ") : "none"}

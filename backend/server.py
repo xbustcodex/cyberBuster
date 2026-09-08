@@ -32,6 +32,8 @@ import jwt as pyjwt
 import seed as seedmod
 import plugins as sm_plugins
 from plugins.crypto import encrypt as sm_encrypt, mask as sm_mask
+import sigma_parser
+import asyncio
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
 log = logging.getLogger("secmaster")
@@ -248,7 +250,30 @@ async def agent_enroll(request: Request):
     await sm_plugins.dispatch(db, "workstation.enrolled", {
         "hostname": ws["hostname"], "workstation_id": ws_id, "os": ws["os"], "profile": ws["profile"],
     })
+    # Auto-enrich on enroll (fire-and-forget): if any query provider is enabled,
+    # scan the workstation IP + any watchlist hashes right away.
+    if ws.get("ip_address"):
+        vt = await _find_enabled_query_plugin("virustotal")
+        sh = await _find_enabled_query_plugin("shodan")
+        if vt or sh:
+            asyncio.create_task(_auto_enrich(ws))
     return {"workstation_id": ws_id, "agent_token": agent_token}
+
+
+async def _auto_enrich(ws: dict) -> None:
+    try:
+        await _run_ioc_for_workstation(ws)
+        await db.audit.insert_one({
+            "id": secrets.token_hex(8),
+            "workstation_id": ws["id"],
+            "hostname": ws["hostname"],
+            "kind": "cve_match",
+            "message": "Auto-enrichment triggered on enroll",
+            "at": _now(),
+            "meta": {"trigger": "auto"},
+        })
+    except Exception as e:
+        log.warning("auto-enrich failed for %s: %s", ws.get("hostname"), e)
 
 
 @api.post("/agent/heartbeat")
@@ -519,7 +544,7 @@ def _serialize_template(t: dict) -> dict:
 
 @api.get("/plugin-templates")
 async def list_templates(_user=Depends(get_current_user)):
-    docs = await db.plugin_templates.find({}).sort("created_at", -1).to_list(200)
+    docs = await db.plugin_templates.find({}).sort([("shared", -1), ("created_at", -1)]).to_list(200)
     return [_serialize_template(t) for t in docs]
 
 
@@ -544,8 +569,32 @@ async def save_as_template(plug_id: str, request: Request, user=Depends(get_curr
         "secrets_encrypted": plug.get("secrets_encrypted", {}) if include_secrets else {},
         "created_by": user.get("email"),
         "created_at": _now(),
+        "shared": bool(body.get("shared", False)),
     }
     await db.plugin_templates.insert_one(doc)
+    return _serialize_template(doc)
+
+
+@api.patch("/plugin-templates/{tpl_id}")
+async def patch_template(tpl_id: str, request: Request, _user=Depends(get_current_user)):
+    body = await request.json()
+    updates: dict = {}
+    if "name" in body:
+        name = (body["name"] or "").strip()
+        if not name:
+            raise HTTPException(400, "Name cannot be empty")
+        existing = await db.plugin_templates.find_one({"name": name, "id": {"$ne": tpl_id}})
+        if existing:
+            raise HTTPException(400, f"Another template already named '{name}'")
+        updates["name"] = name
+    if "shared" in body:
+        updates["shared"] = bool(body["shared"])
+    if not updates:
+        raise HTTPException(400, "Nothing to update")
+    res = await db.plugin_templates.update_one({"id": tpl_id}, {"$set": updates})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Template not found")
+    doc = await db.plugin_templates.find_one({"id": tpl_id})
     return _serialize_template(doc)
 
 
@@ -703,6 +752,13 @@ async def run_ioc_lookup(ws_id: str, request: Request, _user=Depends(get_current
     except Exception: pass
 
     targets = body.get("targets")
+    result = await _run_ioc_for_workstation(ws, explicit_targets=targets)
+    return {"ok": True, **result}
+
+
+async def _run_ioc_for_workstation(ws: dict, explicit_targets: list | None = None) -> dict:
+    """Shared IOC dispatch used by single-ws endpoint, bulk sweep, and auto-enrich."""
+    targets = explicit_targets
     if not targets:
         targets = []
         if ws.get("ip_address"):
@@ -719,49 +775,169 @@ async def run_ioc_lookup(ws_id: str, request: Request, _user=Depends(get_current
         if not (ttype and tval):
             continue
 
-        # VirusTotal
         if vt and ttype in ("ip", "hash", "domain"):
             vt_kind = "hash" if ttype == "hash" else ttype
             r = await sm_plugins.query(db, vt, {"kind": vt_kind, "value": tval})
             summary = _summarize_vt(r.get("response", "")) if r.get("status") == "ok" else {}
             rec = {
                 "id": secrets.token_hex(8),
-                "workstation_id": ws_id,
+                "workstation_id": ws["id"],
                 "hostname": ws.get("hostname"),
                 "target_type": ttype, "target_value": tval,
                 "provider": "virustotal",
-                "status": r.get("status"),
-                "http_status": r.get("http_status"),
+                "status": r.get("status"), "http_status": r.get("http_status"),
                 "summary": summary,
                 "raw_snippet": (r.get("response") or "")[:600],
                 "at": _now(),
             }
             await db.ioc_lookups.insert_one(rec)
+            rec.pop("_id", None)
             results.append(rec)
 
-        # Shodan (IP only)
         if sh and ttype == "ip":
             r = await sm_plugins.query(db, sh, {"ip": tval})
             summary = _summarize_shodan(r.get("response", "")) if r.get("status") == "ok" else {}
             rec = {
                 "id": secrets.token_hex(8),
-                "workstation_id": ws_id,
+                "workstation_id": ws["id"],
                 "hostname": ws.get("hostname"),
                 "target_type": ttype, "target_value": tval,
                 "provider": "shodan",
-                "status": r.get("status"),
-                "http_status": r.get("http_status"),
+                "status": r.get("status"), "http_status": r.get("http_status"),
                 "summary": summary,
                 "raw_snippet": (r.get("response") or "")[:600],
                 "at": _now(),
             }
             await db.ioc_lookups.insert_one(rec)
+            rec.pop("_id", None)
             results.append(rec)
 
-    # Strip _id for JSON response
-    for r in results: r.pop("_id", None)
-    return {"ok": True, "count": len(results), "results": results,
+    return {"count": len(results), "results": results,
             "providers_used": {"virustotal": bool(vt), "shodan": bool(sh)}}
+
+
+@api.post("/ioc/bulk-sweep")
+async def bulk_ioc_sweep(request: Request, user=Depends(get_current_user)):
+    """Run IOC enrichment across every online workstation in one pass."""
+    body: dict = {}
+    try: body = await request.json()
+    except Exception: pass
+    scope = body.get("scope", "online")
+
+    vt = await _find_enabled_query_plugin("virustotal")
+    sh = await _find_enabled_query_plugin("shodan")
+    if not vt and not sh:
+        raise HTTPException(400, "No VirusTotal or Shodan plugin enabled")
+
+    query: dict = {}
+    if scope == "online":
+        query["status"] = "online"
+    workstations = await db.workstations.find(query, {"_id": 0}).to_list(200)
+
+    per_host: list[dict] = []
+    total = 0
+    skipped = 0
+    for ws in workstations:
+        if not ws.get("ip_address"):
+            skipped += 1
+            continue
+        r = await _run_ioc_for_workstation(ws)
+        total += r["count"]
+        per_host.append({
+            "workstation_id": ws["id"],
+            "hostname": ws["hostname"],
+            "ip": ws.get("ip_address"),
+            "lookups": r["count"],
+        })
+    await db.audit.insert_one({
+        "id": secrets.token_hex(8),
+        "workstation_id": "*",
+        "hostname": "*",
+        "kind": "cve_match",  # reuse existing enum
+        "message": f"Bulk IOC sweep ({scope}) by {user['email']} — {total} lookups across {len(per_host)} host(s)",
+        "at": _now(),
+        "meta": {"by": user["email"], "scope": scope, "skipped": skipped},
+    })
+    return {"ok": True, "scope": scope, "hosts_swept": len(per_host), "skipped": skipped,
+            "total_lookups": total, "per_host": per_host,
+            "providers_used": {"virustotal": bool(vt), "shodan": bool(sh)}}
+
+
+# ============================================================
+# SIGMA RULE IMPORT — extract hashes → watchlists
+# ============================================================
+@api.post("/sigma/preview")
+async def sigma_preview(request: Request, _user=Depends(get_current_user)):
+    body = await request.json()
+    text = body.get("sigma_yaml") or ""
+    rules = sigma_parser.parse_sigma(text)
+    flat = sigma_parser.flatten_hashes(rules)
+    return {"rules": rules, "unique_hashes": flat, "hash_count": len(flat)}
+
+
+@api.post("/sigma/import")
+async def sigma_import(request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    text = body.get("sigma_yaml") or ""
+    workstation_ids = body.get("workstation_ids") or []
+    scope = body.get("scope")  # "all-online" | "all" | None
+
+    rules = sigma_parser.parse_sigma(text)
+    flat = sigma_parser.flatten_hashes(rules)
+    if not flat:
+        raise HTTPException(400, "No hashes extracted from Sigma input")
+
+    query: dict = {}
+    if scope == "all-online":
+        query["status"] = "online"
+    elif scope == "all":
+        pass
+    else:
+        if not workstation_ids:
+            raise HTTPException(400, "Provide workstation_ids or scope=all-online|all")
+        query["id"] = {"$in": workstation_ids}
+
+    targets = await db.workstations.find(query, {"id": 1, "hostname": 1, "suspicious_hashes": 1}).to_list(500)
+    if not targets:
+        raise HTTPException(400, "No matching workstations")
+
+    added_per_ws = []
+    for ws in targets:
+        existing = {h.get("hash") for h in (ws.get("suspicious_hashes") or [])}
+        new_entries = []
+        for entry in flat:
+            if entry["hash"] in existing:
+                continue
+            new_entries.append({
+                "hash": entry["hash"],
+                "note": f"sigma: {entry['source_rule']}"[:120],
+                "added_at": _now(),
+                "source": "sigma",
+            })
+        if new_entries:
+            await db.workstations.update_one(
+                {"id": ws["id"]},
+                {"$push": {"suspicious_hashes": {"$each": new_entries, "$position": 0}}},
+            )
+            await db.audit.insert_one({
+                "id": secrets.token_hex(8), "workstation_id": ws["id"], "hostname": ws["hostname"],
+                "kind": "cve_match",
+                "message": f"Sigma import: {len(new_entries)} hash IOC(s) added by {user['email']}",
+                "at": _now(), "meta": {"rules": len(rules)},
+            })
+        added_per_ws.append({
+            "workstation_id": ws["id"],
+            "hostname": ws["hostname"],
+            "added": len(new_entries),
+        })
+
+    return {
+        "ok": True,
+        "rules_parsed": len(rules),
+        "unique_hashes": len(flat),
+        "targets": len(targets),
+        "per_workstation": added_per_ws,
+    }
 
 
 # ============================================================
