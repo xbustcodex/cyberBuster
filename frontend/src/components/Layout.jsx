@@ -1,7 +1,7 @@
 import { useState, useEffect, createContext, useContext } from "react";
 import { NavLink, useNavigate, useLocation } from "react-router-dom";
 import {
-  Server, ShieldAlert, Layers, Rocket, KeyRound,
+  Server, ShieldAlert, Layers, Rocket, KeyRound, Plug,
   Terminal, LogOut, Activity, Search,
 } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
@@ -17,6 +17,7 @@ const NAV_ITEMS = [
   { to: "/cves", label: "cve-alerts", icon: ShieldAlert, testId: NAV.cve, cmd: "sec-master cve list --severity high" },
   { to: "/profiles", label: "profile-dist", icon: Layers, testId: NAV.profiles, cmd: "sec-master profiles stats" },
   { to: "/releases", label: "signed-releases", icon: Rocket, testId: NAV.releases, cmd: "sec-master releases --verify-sig" },
+  { to: "/plugins", label: "plugins", icon: Plug, testId: "nav-plugins", cmd: "sec-master plugin list" },
   { to: "/enroll", label: "enroll-workstation", icon: KeyRound, testId: NAV.enroll, cmd: "sec-master enroll --generate-token" },
 ];
 

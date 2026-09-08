@@ -60,3 +60,17 @@ export const CLI = {
 };
 
 export const HOME = { emergentLink: "home-emergent-link" };
+
+export const PLUGINS = {
+  installBtn: "plugin-install-btn",
+  catalogCard: "plugin-catalog-card",
+  installedRow: "plugin-installed-row",
+  toggleEnabled: "plugin-toggle-enabled",
+  editBtn: "plugin-edit-btn",
+  deleteBtn: "plugin-delete-btn",
+  testBtn: "plugin-test-btn",
+  drawerName: "plugin-drawer-name",
+  drawerSubmit: "plugin-drawer-submit",
+  executionsRow: "plugin-executions-row",
+  eventFilter: "plugin-event-filter",
+};

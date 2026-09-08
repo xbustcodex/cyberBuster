@@ -29,6 +29,8 @@ from auth import (
 )
 import jwt as pyjwt
 import seed as seedmod
+import plugins as sm_plugins
+from plugins.crypto import encrypt as sm_encrypt, mask as sm_mask
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
 log = logging.getLogger("secmaster")
@@ -149,6 +151,7 @@ async def switch_profile(ws_id: str, body: ProfileSwitchRequest, user=Depends(ge
     ws = await db.workstations.find_one({"id": ws_id})
     if not ws:
         raise HTTPException(404, "Workstation not found")
+    previous = ws["profile"]
     await db.workstations.update_one({"id": ws_id}, {"$set": {"profile": body.profile, "status": "online"}})
     await db.audit.insert_one({
         "id": secrets.token_hex(8),
@@ -157,7 +160,11 @@ async def switch_profile(ws_id: str, body: ProfileSwitchRequest, user=Depends(ge
         "kind": "profile_switch",
         "message": f"Profile switched to {body.profile} by {user['email']}",
         "at": _now(),
-        "meta": {"by": user["email"], "previous": ws["profile"]},
+        "meta": {"by": user["email"], "previous": previous},
+    })
+    await sm_plugins.dispatch(db, "workstation.profile_switched", {
+        "hostname": ws["hostname"], "workstation_id": ws_id,
+        "profile": body.profile, "previous": previous, "by": user["email"],
     })
     return {"ok": True, "profile": body.profile}
 
@@ -237,6 +244,9 @@ async def agent_enroll(request: Request):
         "id": secrets.token_hex(8), "workstation_id": ws_id, "hostname": ws["hostname"],
         "kind": "enroll", "message": "Workstation enrolled", "at": _now(), "meta": {},
     })
+    await sm_plugins.dispatch(db, "workstation.enrolled", {
+        "hostname": ws["hostname"], "workstation_id": ws_id, "os": ws["os"], "profile": ws["profile"],
+    })
     return {"workstation_id": ws_id, "agent_token": agent_token}
 
 
@@ -276,6 +286,7 @@ async def list_cves(severity: Optional[str] = None, _user=Depends(get_current_us
 async def rescan_cves(_user=Depends(get_current_user)):
     workstations = await db.workstations.find({}, {"_id": 0}).to_list(1000)
     updated = 0
+    dispatched = 0
     async for cve in db.cves.find({}):
         matched = 0
         for ws in workstations:
@@ -283,9 +294,19 @@ async def rescan_cves(_user=Depends(get_current_user)):
                 if t.get("name") == cve.get("affected_tool") and t.get("version") in cve.get("affected_versions", []):
                     matched += 1
                     break
+        prev = cve.get("matched_workstations", 0)
         await db.cves.update_one({"_id": cve["_id"]}, {"$set": {"matched_workstations": matched}})
         updated += 1
-    return {"ok": True, "updated": updated}
+        if matched > 0 and matched != prev:
+            await sm_plugins.dispatch(db, "cve.matched", {
+                "cve_id": cve.get("cve_id"), "severity": cve.get("severity"),
+                "cvss": cve.get("cvss"), "affected_tool": cve.get("affected_tool"),
+                "affected_versions": cve.get("affected_versions", []),
+                "matched_workstations": matched, "summary": cve.get("summary"),
+                "remediation": cve.get("remediation"),
+            })
+            dispatched += 1
+    return {"ok": True, "updated": updated, "dispatched": dispatched}
 
 
 # ============================================================
@@ -337,6 +358,149 @@ async def list_audit(limit: int = Query(100, le=500), _user=Depends(get_current_
 
 
 # ============================================================
+# PLUGINS — full integration system
+# ============================================================
+@api.get("/plugins/catalog")
+async def plugin_catalog(_user=Depends(get_current_user)):
+    return sm_plugins.CATALOG
+
+
+@api.get("/plugins/events")
+async def plugin_events(_user=Depends(get_current_user)):
+    return {"event_kinds": sm_plugins.EVENT_KINDS}
+
+
+def _serialize_plugin(p: dict) -> dict:
+    secrets_enc = p.get("secrets_encrypted", {}) or {}
+    out = {k: v for k, v in p.items() if k not in ("_id", "secrets_encrypted")}
+    ptype = sm_plugins.get_type(p["type"])
+    schema = ptype.get("secrets_schema", []) if ptype else []
+    out["secrets_masked"] = {}
+    for f in schema:
+        raw = secrets_enc.get(f["key"], "")
+        out["secrets_masked"][f["key"]] = sm_mask(sm_plugins.decrypt(raw)) if raw else ""
+    return out
+
+
+@api.get("/plugins")
+async def list_plugins(_user=Depends(get_current_user)):
+    docs = await db.plugins.find({}).sort("created_at", -1).to_list(200)
+    return [_serialize_plugin(d) for d in docs]
+
+
+@api.post("/plugins")
+async def create_plugin(request: Request, _user=Depends(get_current_user)):
+    body = await request.json()
+    kind = body.get("type")
+    ptype = sm_plugins.get_type(kind)
+    if not ptype:
+        raise HTTPException(400, f"Unknown plugin type: {kind}")
+
+    subs = body.get("event_subscriptions") or []
+    for s in subs:
+        if s not in ptype.get("supported_events", []):
+            raise HTTPException(400, f"Event {s} not supported by {kind}")
+
+    secrets_in = body.get("secrets") or {}
+    for f in ptype.get("secrets_schema", []):
+        if f.get("required") and not secrets_in.get(f["key"]):
+            raise HTTPException(400, f"Missing required secret: {f['key']}")
+    secrets_enc = {k: sm_encrypt(v) for k, v in secrets_in.items() if v}
+
+    plug_id = secrets.token_hex(10)
+    doc = {
+        "id": plug_id,
+        "type": kind,
+        "name": body.get("name") or ptype["display_name"],
+        "enabled": bool(body.get("enabled", True)),
+        "config": body.get("config") or {},
+        "secrets_encrypted": secrets_enc,
+        "event_subscriptions": subs,
+        "created_at": _now(),
+        "updated_at": _now(),
+        "execution_count": 0,
+        "last_run_at": None,
+        "last_run_status": None,
+    }
+    await db.plugins.insert_one(doc)
+    return _serialize_plugin(doc)
+
+
+@api.patch("/plugins/{plug_id}")
+async def update_plugin(plug_id: str, request: Request, _user=Depends(get_current_user)):
+    body = await request.json()
+    plug = await db.plugins.find_one({"id": plug_id})
+    if not plug:
+        raise HTTPException(404, "Plugin not found")
+    ptype = sm_plugins.get_type(plug["type"])
+
+    updates: dict = {"updated_at": _now()}
+    if "name" in body: updates["name"] = body["name"]
+    if "enabled" in body: updates["enabled"] = bool(body["enabled"])
+    if "config" in body: updates["config"] = body["config"] or {}
+    if "event_subscriptions" in body:
+        subs = body["event_subscriptions"] or []
+        for s in subs:
+            if s not in ptype.get("supported_events", []):
+                raise HTTPException(400, f"Event {s} not supported by {plug['type']}")
+        updates["event_subscriptions"] = subs
+    if "secrets" in body and body["secrets"]:
+        secrets_enc = plug.get("secrets_encrypted", {}) or {}
+        for k, v in body["secrets"].items():
+            if v:
+                secrets_enc[k] = sm_encrypt(v)
+        updates["secrets_encrypted"] = secrets_enc
+    await db.plugins.update_one({"id": plug_id}, {"$set": updates})
+    new_doc = await db.plugins.find_one({"id": plug_id})
+    return _serialize_plugin(new_doc)
+
+
+@api.delete("/plugins/{plug_id}")
+async def delete_plugin(plug_id: str, _user=Depends(get_current_user)):
+    res = await db.plugins.delete_one({"id": plug_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Plugin not found")
+    await db.plugin_executions.delete_many({"plugin_id": plug_id})
+    return {"ok": True}
+
+
+@api.post("/plugins/{plug_id}/test")
+async def test_plugin(plug_id: str, request: Request, user=Depends(get_current_user)):
+    plug = await db.plugins.find_one({"id": plug_id})
+    if not plug:
+        raise HTTPException(404, "Plugin not found")
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    payload = {
+        "note": body.get("note", "manual test-fire from dashboard"),
+        "by": user.get("email"),
+        "severity": "high", "cve_id": "CVE-TEST-0001",
+        "affected_tool": "sec-master-plugin", "matched_workstations": 1,
+    }
+    results = await sm_plugins.dispatch(db, "manual.test", payload, only_plugin_id=plug_id)
+    return {"ok": True, "results": results}
+
+
+@api.post("/plugins/{plug_id}/query")
+async def query_plugin(plug_id: str, request: Request, _user=Depends(get_current_user)):
+    plug = await db.plugins.find_one({"id": plug_id})
+    if not plug:
+        raise HTTPException(404, "Plugin not found")
+    params = await request.json()
+    result = await sm_plugins.query(db, plug, params)
+    return result
+
+
+@api.get("/plugins/{plug_id}/executions")
+async def plugin_executions(plug_id: str, limit: int = Query(50, le=200), _user=Depends(get_current_user)):
+    docs = await db.plugin_executions.find({"plugin_id": plug_id}, {"_id": 0}).sort("at", -1).to_list(limit)
+    return docs
+
+
+# ============================================================
 # HEALTH
 # ============================================================
 @api.get("/")
@@ -363,6 +527,8 @@ async def startup():
     await db.workstations.create_index("agent_token")
     await db.enroll_tokens.create_index("token", unique=True)
     await db.cves.create_index("cve_id", unique=True)
+    await db.plugins.create_index("id", unique=True)
+    await db.plugin_executions.create_index("plugin_id")
 
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@secmaster.io").lower()
     admin_pw = os.environ.get("ADMIN_PASSWORD", "admin1234")
