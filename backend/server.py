@@ -6,6 +6,7 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 import os
+import json
 import logging
 import secrets
 from datetime import datetime, timezone, timedelta
@@ -501,6 +502,269 @@ async def plugin_executions(plug_id: str, limit: int = Query(50, le=200), _user=
 
 
 # ============================================================
+# PLUGIN TEMPLATES — save named configs, one-click reuse
+# ============================================================
+def _serialize_template(t: dict) -> dict:
+    out = {k: v for k, v in t.items() if k not in ("_id", "secrets_encrypted")}
+    ptype = sm_plugins.get_type(t["type"])
+    schema = ptype.get("secrets_schema", []) if ptype else []
+    secrets_enc = t.get("secrets_encrypted", {}) or {}
+    out["has_secrets"] = bool(secrets_enc)
+    out["secrets_masked"] = {}
+    for f in schema:
+        raw = secrets_enc.get(f["key"], "")
+        out["secrets_masked"][f["key"]] = sm_mask(sm_plugins.decrypt(raw)) if raw else ""
+    return out
+
+
+@api.get("/plugin-templates")
+async def list_templates(_user=Depends(get_current_user)):
+    docs = await db.plugin_templates.find({}).sort("created_at", -1).to_list(200)
+    return [_serialize_template(t) for t in docs]
+
+
+@api.post("/plugins/{plug_id}/save-as-template")
+async def save_as_template(plug_id: str, request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "Template name required")
+    include_secrets = bool(body.get("include_secrets", False))
+    plug = await db.plugins.find_one({"id": plug_id})
+    if not plug:
+        raise HTTPException(404, "Plugin not found")
+    if await db.plugin_templates.find_one({"name": name}):
+        raise HTTPException(400, f"Template '{name}' already exists")
+    doc = {
+        "id": secrets.token_hex(10),
+        "name": name,
+        "type": plug["type"],
+        "config": plug.get("config", {}),
+        "event_subscriptions": plug.get("event_subscriptions", []),
+        "secrets_encrypted": plug.get("secrets_encrypted", {}) if include_secrets else {},
+        "created_by": user.get("email"),
+        "created_at": _now(),
+    }
+    await db.plugin_templates.insert_one(doc)
+    return _serialize_template(doc)
+
+
+@api.delete("/plugin-templates/{tpl_id}")
+async def delete_template(tpl_id: str, _user=Depends(get_current_user)):
+    res = await db.plugin_templates.delete_one({"id": tpl_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Template not found")
+    return {"ok": True}
+
+
+@api.post("/plugins/from-template/{tpl_id}")
+async def install_from_template(tpl_id: str, request: Request, _user=Depends(get_current_user)):
+    tpl = await db.plugin_templates.find_one({"id": tpl_id})
+    if not tpl:
+        raise HTTPException(404, "Template not found")
+    ptype = sm_plugins.get_type(tpl["type"])
+    if not ptype:
+        raise HTTPException(400, "Template plugin type no longer available")
+    body: dict = {}
+    try: body = await request.json()
+    except Exception: pass
+
+    secrets_enc = dict(tpl.get("secrets_encrypted", {}) or {})
+    for k, v in (body.get("secrets") or {}).items():
+        if v:
+            secrets_enc[k] = sm_encrypt(v)
+
+    for f in ptype.get("secrets_schema", []):
+        if f.get("required") and not secrets_enc.get(f["key"]):
+            raise HTTPException(400, f"Missing required secret from template: {f['key']}")
+
+    plug_id = secrets.token_hex(10)
+    doc = {
+        "id": plug_id,
+        "type": tpl["type"],
+        "name": (body.get("name") or f"{ptype['display_name']} (from {tpl['name']})"),
+        "enabled": bool(body.get("enabled", True)),
+        "config": {**(tpl.get("config") or {}), **(body.get("config_overrides") or {})},
+        "secrets_encrypted": secrets_enc,
+        "event_subscriptions": body.get("event_subscriptions") or tpl.get("event_subscriptions", []),
+        "created_at": _now(),
+        "updated_at": _now(),
+        "execution_count": 0,
+        "last_run_at": None,
+        "last_run_status": None,
+        "template_id": tpl_id,
+    }
+    await db.plugins.insert_one(doc)
+    return _serialize_plugin(doc)
+
+
+# ============================================================
+# IOC LOOKUPS — VirusTotal + Shodan enrichment per workstation
+# ============================================================
+async def _find_enabled_query_plugin(kind: str) -> dict | None:
+    return await db.plugins.find_one({"type": kind, "enabled": True})
+
+
+def _summarize_vt(response: str) -> dict:
+    try:
+        parsed = json.loads(response)
+        attr = (parsed.get("data") or {}).get("attributes") or {}
+        stats = attr.get("last_analysis_stats") or {}
+        return {
+            "malicious": stats.get("malicious", 0),
+            "suspicious": stats.get("suspicious", 0),
+            "harmless": stats.get("harmless", 0),
+            "undetected": stats.get("undetected", 0),
+            "reputation": attr.get("reputation"),
+            "country": attr.get("country"),
+            "as_owner": attr.get("as_owner"),
+        }
+    except Exception:
+        return {}
+
+
+def _summarize_shodan(response: str) -> dict:
+    try:
+        parsed = json.loads(response)
+        return {
+            "org": parsed.get("org"),
+            "isp": parsed.get("isp"),
+            "country": parsed.get("country_name"),
+            "os": parsed.get("os"),
+            "ports": (parsed.get("ports") or [])[:20],
+            "vulns": list((parsed.get("vulns") or {}).keys())[:20]
+                     if isinstance(parsed.get("vulns"), dict)
+                     else (parsed.get("vulns") or [])[:20],
+            "tags": parsed.get("tags") or [],
+            "hostnames": parsed.get("hostnames") or [],
+        }
+    except Exception:
+        return {}
+
+
+@api.get("/workstations/{ws_id}/ioc")
+async def get_ioc(ws_id: str, _user=Depends(get_current_user)):
+    ws = await db.workstations.find_one({"id": ws_id}, {"_id": 0})
+    if not ws:
+        raise HTTPException(404, "Workstation not found")
+    history = await db.ioc_lookups.find({"workstation_id": ws_id}, {"_id": 0}).sort("at", -1).to_list(50)
+    vt = await _find_enabled_query_plugin("virustotal")
+    sh = await _find_enabled_query_plugin("shodan")
+    return {
+        "ip_address": ws.get("ip_address"),
+        "suspicious_hashes": ws.get("suspicious_hashes", []),
+        "history": history,
+        "providers": {
+            "virustotal": {"enabled": bool(vt), "plugin_id": vt["id"] if vt else None},
+            "shodan": {"enabled": bool(sh), "plugin_id": sh["id"] if sh else None},
+        },
+    }
+
+
+@api.post("/workstations/{ws_id}/ioc/hashes")
+async def add_hash(ws_id: str, request: Request, _user=Depends(get_current_user)):
+    ws = await db.workstations.find_one({"id": ws_id})
+    if not ws:
+        raise HTTPException(404, "Workstation not found")
+    body = await request.json()
+    h = (body.get("hash") or "").strip().lower()
+    note = (body.get("note") or "").strip()
+    if not h or len(h) not in (32, 40, 64):
+        raise HTTPException(400, "Hash must be MD5/SHA1/SHA256")
+    entry = {"hash": h, "note": note, "added_at": _now()}
+    await db.workstations.update_one(
+        {"id": ws_id},
+        {"$pull": {"suspicious_hashes": {"hash": h}}},
+    )
+    await db.workstations.update_one(
+        {"id": ws_id},
+        {"$push": {"suspicious_hashes": {"$each": [entry], "$position": 0}}},
+    )
+    return {"ok": True, "entry": entry}
+
+
+@api.delete("/workstations/{ws_id}/ioc/hashes/{hash_value}")
+async def remove_hash(ws_id: str, hash_value: str, _user=Depends(get_current_user)):
+    await db.workstations.update_one(
+        {"id": ws_id},
+        {"$pull": {"suspicious_hashes": {"hash": hash_value.lower()}}},
+    )
+    await db.ioc_lookups.delete_many({"workstation_id": ws_id, "target_value": hash_value.lower()})
+    return {"ok": True}
+
+
+@api.post("/workstations/{ws_id}/ioc/lookup")
+async def run_ioc_lookup(ws_id: str, request: Request, _user=Depends(get_current_user)):
+    ws = await db.workstations.find_one({"id": ws_id}, {"_id": 0})
+    if not ws:
+        raise HTTPException(404, "Workstation not found")
+    body: dict = {}
+    try: body = await request.json()
+    except Exception: pass
+
+    targets = body.get("targets")
+    if not targets:
+        targets = []
+        if ws.get("ip_address"):
+            targets.append({"type": "ip", "value": ws["ip_address"]})
+        for h in ws.get("suspicious_hashes", []):
+            targets.append({"type": "hash", "value": h["hash"]})
+
+    vt = await _find_enabled_query_plugin("virustotal")
+    sh = await _find_enabled_query_plugin("shodan")
+
+    results = []
+    for tgt in targets:
+        ttype, tval = tgt.get("type"), tgt.get("value")
+        if not (ttype and tval):
+            continue
+
+        # VirusTotal
+        if vt and ttype in ("ip", "hash", "domain"):
+            vt_kind = "hash" if ttype == "hash" else ttype
+            r = await sm_plugins.query(db, vt, {"kind": vt_kind, "value": tval})
+            summary = _summarize_vt(r.get("response", "")) if r.get("status") == "ok" else {}
+            rec = {
+                "id": secrets.token_hex(8),
+                "workstation_id": ws_id,
+                "hostname": ws.get("hostname"),
+                "target_type": ttype, "target_value": tval,
+                "provider": "virustotal",
+                "status": r.get("status"),
+                "http_status": r.get("http_status"),
+                "summary": summary,
+                "raw_snippet": (r.get("response") or "")[:600],
+                "at": _now(),
+            }
+            await db.ioc_lookups.insert_one(rec)
+            results.append(rec)
+
+        # Shodan (IP only)
+        if sh and ttype == "ip":
+            r = await sm_plugins.query(db, sh, {"ip": tval})
+            summary = _summarize_shodan(r.get("response", "")) if r.get("status") == "ok" else {}
+            rec = {
+                "id": secrets.token_hex(8),
+                "workstation_id": ws_id,
+                "hostname": ws.get("hostname"),
+                "target_type": ttype, "target_value": tval,
+                "provider": "shodan",
+                "status": r.get("status"),
+                "http_status": r.get("http_status"),
+                "summary": summary,
+                "raw_snippet": (r.get("response") or "")[:600],
+                "at": _now(),
+            }
+            await db.ioc_lookups.insert_one(rec)
+            results.append(rec)
+
+    # Strip _id for JSON response
+    for r in results: r.pop("_id", None)
+    return {"ok": True, "count": len(results), "results": results,
+            "providers_used": {"virustotal": bool(vt), "shodan": bool(sh)}}
+
+
+# ============================================================
 # HEALTH
 # ============================================================
 @api.get("/")
@@ -529,6 +793,8 @@ async def startup():
     await db.cves.create_index("cve_id", unique=True)
     await db.plugins.create_index("id", unique=True)
     await db.plugin_executions.create_index("plugin_id")
+    await db.plugin_templates.create_index("name", unique=True)
+    await db.ioc_lookups.create_index([("workstation_id", 1), ("at", -1)])
 
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@secmaster.io").lower()
     admin_pw = os.environ.get("ADMIN_PASSWORD", "admin1234")

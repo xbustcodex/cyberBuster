@@ -5,6 +5,7 @@ import { WS } from "@/constants/testIds";
 import { useCli } from "@/components/Layout";
 import { ArrowLeft, Terminal, Trash2 } from "lucide-react";
 import { toast } from "sonner";
+import IocPanel from "@/components/IocPanel";
 
 const PROFILE_META = {
   offense: { color: "var(--red-offense)", bg: "rgba(247,118,142,0.15)" },
@@ -109,51 +110,63 @@ export default function WorkstationDetail() {
         </div>
       </div>
 
-      {/* Tools */}
-      <div className="border rounded-sm" style={{ background: "var(--bg-card)", borderColor: "var(--border-subtle)" }}>
-        <div className="px-4 py-2 border-b flex items-center justify-between" style={{ borderColor: "var(--border-subtle)" }}>
-          <div className="font-mono text-xs uppercase tracking-widest text-[#565f89]">installed tools ({ws.tools?.length || 0})</div>
-          <button data-testid={WS.driftToggle} onClick={() => setShowDrift(!showDrift)} className="text-[10px] font-mono uppercase tracking-widest text-[#a9b1d6] hover:text-[#c0caf5]">
-            {showDrift ? "hide" : "show"} drift-diff
-          </button>
-        </div>
-        <div className="overflow-x-auto">
-          <table data-testid={WS.toolTable} className="min-w-full text-xs font-mono">
-            <thead>
-              <tr className="text-left uppercase text-[10px] tracking-widest text-[#565f89] border-b" style={{ borderColor: "var(--border-subtle)" }}>
-                <th className="px-4 py-2">tool</th>
-                <th className="px-4 py-2">version</th>
-                <th className="px-4 py-2">expected</th>
-                <th className="px-4 py-2">status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(ws.tools || []).map((t, i) => (
-                <tr key={i} className="row-hover border-b" style={{ borderColor: "var(--border-subtle)" }}>
-                  <td className="px-4 py-2 text-[#c0caf5]">{t.name}</td>
-                  <td className="px-4 py-2 text-[#a9b1d6]">{t.version}</td>
-                  <td className="px-4 py-2 text-[#565f89]">{t.version}</td>
-                  <td className="px-4 py-2"><span className="dot" style={{ color: "var(--status-online)", background: "var(--status-online)" }} /> <span className="text-[10px] uppercase tracking-widest text-[#9ece6a]">pinned</span></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      {/* Main grid: left = tools+audit, right = IOC enrichment */}
+      <div className="grid gap-4 lg:grid-cols-3">
+        <div className="lg:col-span-2 space-y-4">
+          {/* Tools */}
+          <div className="border rounded-sm" style={{ background: "var(--bg-card)", borderColor: "var(--border-subtle)" }}>
+            <div className="px-4 py-2 border-b flex items-center justify-between" style={{ borderColor: "var(--border-subtle)" }}>
+              <div className="font-mono text-xs uppercase tracking-widest text-[#565f89]">installed tools ({ws.tools?.length || 0})</div>
+              <button data-testid={WS.driftToggle} onClick={() => setShowDrift(!showDrift)} className="text-[10px] font-mono uppercase tracking-widest text-[#a9b1d6] hover:text-[#c0caf5]">
+                {showDrift ? "hide" : "show"} drift-diff
+              </button>
+            </div>
+            <div className="overflow-x-auto">
+              <table data-testid={WS.toolTable} className="min-w-full text-xs font-mono">
+                <thead>
+                  <tr className="text-left uppercase text-[10px] tracking-widest text-[#565f89] border-b" style={{ borderColor: "var(--border-subtle)" }}>
+                    <th className="px-4 py-2">tool</th>
+                    <th className="px-4 py-2">version</th>
+                    <th className="px-4 py-2">expected</th>
+                    <th className="px-4 py-2">status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(ws.tools || []).map((t, i) => (
+                    <tr key={i} className="row-hover border-b" style={{ borderColor: "var(--border-subtle)" }}>
+                      <td className="px-4 py-2 text-[#c0caf5]">{t.name}</td>
+                      <td className="px-4 py-2 text-[#a9b1d6]">{t.version}</td>
+                      <td className="px-4 py-2 text-[#565f89]">{t.version}</td>
+                      <td className="px-4 py-2"><span className="dot" style={{ color: "var(--status-online)", background: "var(--status-online)" }} /> <span className="text-[10px] uppercase tracking-widest text-[#9ece6a]">pinned</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
 
-      {/* Audit */}
-      <div className="border rounded-sm" style={{ background: "var(--bg-card)", borderColor: "var(--border-subtle)" }}>
-        <div className="px-4 py-2 border-b font-mono text-xs uppercase tracking-widest text-[#565f89]" style={{ borderColor: "var(--border-subtle)" }}>audit timeline</div>
-        <ul data-testid={WS.auditTimeline} className="divide-y" style={{ borderColor: "var(--border-subtle)" }}>
-          {audit.length === 0 && <li className="px-4 py-6 text-center text-[10px] font-mono text-[#565f89]">no audit events yet</li>}
-          {audit.map((a) => (
-            <li key={a.id} className="px-4 py-2 flex gap-3 text-xs font-mono">
-              <span className="text-[#565f89] w-40 flex-shrink-0">{new Date(a.at).toISOString().replace("T", " ").slice(0, 19)}</span>
-              <span className="text-[#bb9af7] w-28 flex-shrink-0">{a.kind}</span>
-              <span className="text-[#c0caf5]">{a.message}</span>
-            </li>
-          ))}
-        </ul>
+          {/* Audit */}
+          <div className="border rounded-sm" style={{ background: "var(--bg-card)", borderColor: "var(--border-subtle)" }}>
+            <div className="px-4 py-2 border-b font-mono text-xs uppercase tracking-widest text-[#565f89]" style={{ borderColor: "var(--border-subtle)" }}>audit timeline</div>
+            <ul data-testid={WS.auditTimeline} className="divide-y" style={{ borderColor: "var(--border-subtle)" }}>
+              {audit.length === 0 && <li className="px-4 py-6 text-center text-[10px] font-mono text-[#565f89]">no audit events yet</li>}
+              {audit.map((a) => (
+                <li key={a.id} className="px-4 py-2 flex gap-3 text-xs font-mono">
+                  <span className="text-[#565f89] w-40 flex-shrink-0">{new Date(a.at).toISOString().replace("T", " ").slice(0, 19)}</span>
+                  <span className="text-[#bb9af7] w-28 flex-shrink-0">{a.kind}</span>
+                  <span className="text-[#c0caf5]">{a.message}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+
+        {/* IOC right rail */}
+        <aside className="lg:col-span-1">
+          <div className="lg:sticky lg:top-16">
+            <IocPanel workstationId={id} />
+          </div>
+        </aside>
       </div>
     </div>
   );

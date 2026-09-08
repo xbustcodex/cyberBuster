@@ -3,7 +3,7 @@ import { api } from "@/lib/api";
 import { PLUGINS } from "@/constants/testIds";
 import { useCli } from "@/components/Layout";
 import {
-  Plug, Plus, RefreshCw, Play, Trash2, Pencil,
+  Plug, Plus, RefreshCw, Play, Trash2, Pencil, Bookmark, Sparkles,
   CheckCircle2, XCircle, Terminal, ChevronDown, X, Search,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -15,9 +15,79 @@ const CATEGORY_COLOR = {
   custom: "var(--status-drift)",
 };
 
+// ---------------- Save-as-template modal ----------------
+function SaveTemplateModal({ open, plugin, onClose, onSaved }) {
+  const [name, setName] = useState("");
+  const [includeSecrets, setIncludeSecrets] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (open && plugin) {
+      setName(`${plugin.name} template`);
+      setIncludeSecrets(false);
+    }
+  }, [open, plugin]);
+
+  if (!open || !plugin) return null;
+
+  const save = async () => {
+    if (!name.trim()) { toast.error("Name required"); return; }
+    setBusy(true);
+    try {
+      await api.post(`/plugins/${plugin.id}/save-as-template`, { name: name.trim(), include_secrets: includeSecrets });
+      toast.success(`Template "${name}" saved`);
+      onSaved(); onClose();
+    } catch (e) { toast.error(e.response?.data?.detail || "Save failed"); }
+    setBusy(false);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+      <div onClick={(e) => e.stopPropagation()}
+        className="relative z-10 max-w-md w-full border rounded-sm p-5 space-y-4 enter"
+        style={{ background: "var(--bg-card)", borderColor: "var(--border-subtle)" }}>
+        <div className="flex items-center gap-2">
+          <Bookmark size={14} style={{ color: "var(--purple-analyst)" }} />
+          <div className="font-mono text-xs uppercase tracking-widest text-[#c0caf5]">save as template</div>
+        </div>
+        <p className="text-xs text-[#a9b1d6]">
+          Templates are reusable plugin configs. Install a fresh {plugin.type} plugin with one click.
+        </p>
+        <div>
+          <label className="block text-[10px] font-mono uppercase tracking-widest text-[#565f89] mb-1">template name</label>
+          <input data-testid="template-save-name" value={name} onChange={(e) => setName(e.target.value)}
+            className="w-full px-3 py-2 font-mono text-sm bg-[#16161e] border rounded-sm focus:outline-none focus:border-[#bb9af7]"
+            style={{ borderColor: "var(--border-subtle)", color: "var(--text-primary)" }} />
+        </div>
+        <label className="flex items-start gap-2 text-xs font-mono cursor-pointer">
+          <input type="checkbox" checked={includeSecrets} onChange={(e) => setIncludeSecrets(e.target.checked)} className="mt-0.5" />
+          <span>
+            <span className="text-[#c0caf5]">include encrypted secrets</span>
+            <span className="block text-[10px] text-[#565f89] leading-relaxed">
+              secrets stay encrypted at rest · anyone with dashboard access can spawn a working copy · leave off for public templates
+            </span>
+          </span>
+        </label>
+        <div className="flex gap-2 justify-end pt-2 border-t" style={{ borderColor: "var(--border-subtle)" }}>
+          <button onClick={onClose} className="px-3 py-1.5 text-xs font-mono uppercase tracking-widest border rounded-sm hover:bg-[#292e42]"
+            style={{ borderColor: "var(--border-subtle)" }}>cancel</button>
+          <button data-testid="template-save-submit" onClick={save} disabled={busy}
+            className="px-3 py-1.5 text-xs font-mono uppercase tracking-widest border rounded-sm hover:bg-[#292e42] disabled:opacity-60"
+            style={{ borderColor: "var(--border-accent)", color: "var(--text-primary)" }}>{busy ? "saving…" : "save"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ---------------- Drawer for install / edit ----------------
-function PluginDrawer({ open, onClose, mode, plugin, catalog, events, onSaved }) {
-  const type = mode === "install" ? plugin : catalog.find((c) => c.kind === plugin?.type);
+function PluginDrawer({ open, onClose, mode, plugin, template, catalog, events, onSaved }) {
+  const type = mode === "install"
+    ? plugin
+    : mode === "from-template"
+    ? catalog.find((c) => c.kind === template?.type)
+    : catalog.find((c) => c.kind === plugin?.type);
   const [name, setName] = useState("");
   const [enabled, setEnabled] = useState(true);
   const [config, setConfig] = useState({});
@@ -35,6 +105,12 @@ function PluginDrawer({ open, onClose, mode, plugin, catalog, events, onSaved })
       setConfig(defaults);
       setSecretsInput({});
       setSubs([...(type.supported_events || [])]);
+    } else if (mode === "from-template") {
+      setName(`${type.display_name} · ${template.name}`);
+      setEnabled(true);
+      setConfig({ ...(template.config || {}) });
+      setSecretsInput({});
+      setSubs([...(template.event_subscriptions || [])]);
     } else {
       setName(plugin.name);
       setEnabled(plugin.enabled);
@@ -42,11 +118,11 @@ function PluginDrawer({ open, onClose, mode, plugin, catalog, events, onSaved })
       setSecretsInput({});
       setSubs([...(plugin.event_subscriptions || [])]);
     }
-  }, [open, mode, plugin, type]);
+  }, [open, mode, plugin, template, type]);
 
   if (!open || !type) return null;
 
-  const kind = mode === "install" ? type.kind : plugin.type;
+  const kind = mode === "install" ? type.kind : mode === "from-template" ? template.type : plugin.type;
 
   const save = async () => {
     setBusy(true);
@@ -57,6 +133,14 @@ function PluginDrawer({ open, onClose, mode, plugin, catalog, events, onSaved })
           secrets: secretsInput, event_subscriptions: subs,
         });
         toast.success(`${type.display_name} installed`);
+      } else if (mode === "from-template") {
+        await api.post(`/plugins/from-template/${template.id}`, {
+          name, enabled,
+          config_overrides: config,
+          secrets: secretsInput,
+          event_subscriptions: subs,
+        });
+        toast.success(`Installed from template "${template.name}"`);
       } else {
         const patch = { name, enabled, config, event_subscriptions: subs };
         if (Object.values(secretsInput).some(Boolean)) patch.secrets = secretsInput;
@@ -72,7 +156,11 @@ function PluginDrawer({ open, onClose, mode, plugin, catalog, events, onSaved })
   };
 
   const isQueryOnly = (type.capabilities || []).includes("query") && !(type.capabilities || []).includes("dispatch");
-  const secretsExisting = mode === "edit" ? plugin.secrets_masked || {} : {};
+  const secretsExisting = mode === "edit"
+    ? plugin.secrets_masked || {}
+    : mode === "from-template"
+    ? template.secrets_masked || {}
+    : {};
 
   return (
     <div className="fixed inset-0 z-50" onClick={onClose}>
@@ -157,7 +245,7 @@ function PluginDrawer({ open, onClose, mode, plugin, catalog, events, onSaved })
                   </label>
                   <input type="password" autoComplete="off"
                     value={secretsInput[f.key] ?? ""} onChange={(e) => setSecretsInput({ ...secretsInput, [f.key]: e.target.value })}
-                    placeholder={mode === "edit" && secretsExisting[f.key] ? `current: ${secretsExisting[f.key]}` : "•••••••"}
+                    placeholder={(mode === "edit" || mode === "from-template") && secretsExisting[f.key] ? `current: ${secretsExisting[f.key]}` : "•••••••"}
                     className="w-full px-3 py-2 font-mono text-sm bg-[#16161e] border rounded-sm focus:outline-none focus:border-[#bb9af7]"
                     style={{ borderColor: "var(--border-subtle)", color: "var(--text-primary)" }} />
                 </div>
@@ -191,7 +279,10 @@ function PluginDrawer({ open, onClose, mode, plugin, catalog, events, onSaved })
           <button data-testid={PLUGINS.drawerSubmit} onClick={save} disabled={busy}
             className="w-full py-2 font-mono text-xs uppercase tracking-widest border rounded-sm hover:bg-[#292e42] disabled:opacity-60"
             style={{ borderColor: "var(--border-accent)", color: "var(--text-primary)" }}>
-            {busy ? "saving…" : mode === "install" ? "install plugin" : "save changes"}
+            {busy ? "saving…"
+              : mode === "install" ? "install plugin"
+              : mode === "from-template" ? "install from template"
+              : "save changes"}
           </button>
         </div>
       </aside>
@@ -250,21 +341,24 @@ function ExecutionsViewer({ plugin, onClose }) {
 export default function Plugins() {
   const [catalog, setCatalog] = useState([]);
   const [installed, setInstalled] = useState([]);
+  const [templates, setTemplates] = useState([]);
   const [events, setEvents] = useState([]);
   const [q, setQ] = useState("");
   const [category, setCategory] = useState("all");
-  const [drawer, setDrawer] = useState(null);   // {mode, plugin}
+  const [drawer, setDrawer] = useState(null);   // {mode, plugin, template}
   const [execFor, setExecFor] = useState(null);
+  const [saveTplFor, setSaveTplFor] = useState(null);
   const { openCli } = useCli();
 
   const load = async () => {
     try {
-      const [c, p, e] = await Promise.all([
+      const [c, p, t, e] = await Promise.all([
         api.get("/plugins/catalog"),
         api.get("/plugins"),
+        api.get("/plugin-templates"),
         api.get("/plugins/events"),
       ]);
-      setCatalog(c.data); setInstalled(p.data); setEvents(e.data.event_kinds || []);
+      setCatalog(c.data); setInstalled(p.data); setTemplates(t.data); setEvents(e.data.event_kinds || []);
     } catch { toast.error("Failed to load plugins"); }
   };
   useEffect(() => { load(); }, []);
@@ -297,6 +391,12 @@ export default function Plugins() {
   const remove = async (p) => {
     if (!confirm(`Uninstall ${p.name}?`)) return;
     try { await api.delete(`/plugins/${p.id}`); toast.success("uninstalled"); load(); }
+    catch { toast.error("delete failed"); }
+  };
+
+  const deleteTemplate = async (t) => {
+    if (!confirm(`Delete template "${t.name}"?`)) return;
+    try { await api.delete(`/plugin-templates/${t.id}`); toast.success("template deleted"); load(); }
     catch { toast.error("delete failed"); }
   };
 
@@ -388,6 +488,10 @@ export default function Plugins() {
                             className="p-1 border rounded-sm hover:bg-[#292e42]" style={{ borderColor: "var(--border-subtle)" }}>
                             <Pencil size={10} />
                           </button>
+                          <button data-testid="plugin-save-template-btn" onClick={() => setSaveTplFor(p)} title="save as template"
+                            className="p-1 border rounded-sm hover:bg-[#292e42]" style={{ borderColor: "var(--border-subtle)", color: "var(--purple-analyst)" }}>
+                            <Bookmark size={10} />
+                          </button>
                           <button data-testid={PLUGINS.deleteBtn} onClick={() => remove(p)} title="delete"
                             className="p-1 border rounded-sm hover:bg-[#292e42]" style={{ borderColor: "var(--border-subtle)", color: "var(--sev-high)" }}>
                             <Trash2 size={10} />
@@ -402,6 +506,53 @@ export default function Plugins() {
           </div>
         )}
       </section>
+
+      {/* Templates */}
+      {templates.length > 0 && (
+        <section className="border rounded-sm" style={{ background: "var(--bg-card)", borderColor: "var(--border-subtle)" }}>
+          <div className="px-4 py-2 border-b flex items-center gap-2" style={{ borderColor: "var(--border-subtle)" }}>
+            <Bookmark size={12} style={{ color: "var(--purple-analyst)" }} />
+            <div className="font-mono text-xs uppercase tracking-widest text-[#565f89]">templates ({templates.length})</div>
+            <div className="text-[10px] font-mono text-[#565f89] ml-2">one-click reuse · secrets encrypted</div>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3 p-4">
+            {templates.map((t) => {
+              const type = catalog.find((c) => c.kind === t.type);
+              const cat = type?.category || "custom";
+              return (
+                <article key={t.id} data-testid="template-card" className="border rounded-sm p-3 flex flex-col gap-2"
+                  style={{ borderColor: "var(--border-subtle)", background: "var(--bg-terminal)" }}>
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <Sparkles size={12} style={{ color: CATEGORY_COLOR[cat] }} />
+                        <div className="font-mono text-sm text-[#c0caf5] truncate">{t.name}</div>
+                      </div>
+                      <div className="mt-1 flex items-center gap-2 text-[10px] font-mono">
+                        <span className="uppercase tracking-widest" style={{ color: CATEGORY_COLOR[cat] }}>{t.type}</span>
+                        {t.has_secrets && <span className="px-1 py-0.5 border rounded-sm uppercase tracking-widest text-[9px]"
+                          style={{ borderColor: "var(--purple-analyst)", color: "var(--purple-analyst)" }}>with secrets</span>}
+                      </div>
+                    </div>
+                    <button onClick={() => deleteTemplate(t)} className="p-1 border rounded-sm hover:bg-[#292e42]"
+                      style={{ borderColor: "var(--border-subtle)", color: "var(--sev-high)" }}>
+                      <Trash2 size={10} />
+                    </button>
+                  </div>
+                  <div className="text-[10px] font-mono text-[#565f89]">
+                    events: {t.event_subscriptions?.length ? t.event_subscriptions.join(", ") : "none"}
+                  </div>
+                  <button data-testid="template-use-btn" onClick={() => setDrawer({ mode: "from-template", template: t })}
+                    className="mt-1 flex items-center justify-center gap-1 px-2 py-1 text-[10px] font-mono uppercase tracking-widest border rounded-sm hover:bg-[#292e42]"
+                    style={{ borderColor: "var(--border-accent)", color: "var(--text-primary)" }}>
+                    <Plus size={10} /> use template
+                  </button>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      )}
 
       {/* Catalog */}
       <section>
@@ -465,11 +616,13 @@ export default function Plugins() {
         onClose={() => setDrawer(null)}
         mode={drawer?.mode}
         plugin={drawer?.plugin}
+        template={drawer?.template}
         catalog={catalog}
         events={events}
         onSaved={load}
       />
       <ExecutionsViewer plugin={execFor} onClose={() => setExecFor(null)} />
+      <SaveTemplateModal open={!!saveTplFor} plugin={saveTplFor} onClose={() => setSaveTplFor(null)} onSaved={load} />
     </div>
   );
 }
