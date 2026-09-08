@@ -1,0 +1,215 @@
+{
+  "project_identity": {
+    "name": "Security Master — Cross-Platform Hardened Analyst Toolchain",
+    "persona": "E1 Anti-AI Designer (High Density Security Ops & CLI-First Command Center)",
+    "archetype": "Tokyo Night & Hardened Tactical IDE",
+    "theme_mode": "dark",
+    "design_philosophy": "CLI-First, Terminal-Inspired Precision. Grid + Data Tables over marketing fluff. Dense, scanable security analytics, monospace data cells, keyboard shortcuts everywhere, and transparent CLI command equivalents for every GUI action."
+  },
+  "responsive": {
+    "breakpoint": "mobile-first",
+    "layout_reflow": {
+      "mobile": "Single column vertical stack, collapsible sidebar drawer, horizontally scrollable data tables with fixed left identifier column, stacked metric cards.",
+      "tablet": "2-column grid for stat widgets, compact table headers, drawer overlay for CLI action inspector.",
+      "desktop": "12-column Bento / IDE layout with fixed left sidebar nav, sticky top health status bar, main multi-panel workspace, split-pane CLI action drawer on right or overlay."
+    },
+    "typography_scale": {
+      "h1": "text-2xl sm:text-3xl lg:text-4xl font-mono tracking-tight",
+      "h2": "text-lg sm:text-xl lg:text-2xl font-mono font-semibold tracking-tight",
+      "h3": "text-base sm:text-lg font-mono font-medium",
+      "body": "text-xs sm:text-sm font-sans leading-relaxed text-[#c0caf5]",
+      "mono_data": "text-xs sm:text-sm font-mono tracking-tight text-[#c0caf5]",
+      "badge": "text-[10px] sm:text-xs font-mono uppercase tracking-wider"
+    },
+    "overflow_guard": "Ensure max-w-full, min-w-0 on flex/grid children, max-h-[85vh] for mobile sheets/dialogs, overflow-x-auto with custom 4px dark scrollbar for data tables.",
+    "tap_targets": "Minimum 44x44px touch areas for mobile buttons and table row expanders; 8px padding on interactive table action icons."
+  },
+  "colors": {
+    "background": {
+      "main": "#1a1b26",
+      "sidebar": "#1f2335",
+      "card": "#24283b",
+      "card_hover": "#292e42",
+      "terminal": "#15161e",
+      "input": "#16161e"
+    },
+    "borders": {
+      "subtle": "#3b4261",
+      "accent": "#7aa2f7",
+      "focus": "#bb9af7"
+    },
+    "text": {
+      "primary": "#c0caf5",
+      "secondary": "#a9b1d6",
+      "muted": "#565f89",
+      "highlight": "#ffffff"
+    },
+    "profiles": {
+      "red_offense": {
+        "hex": "#f7768e",
+        "label": "RED / OFFENSE",
+        "bg_badge": "rgba(247, 118, 142, 0.15)",
+        "border": "#f7768e"
+      },
+      "blue_defense": {
+        "hex": "#7dcfff",
+        "label": "BLUE / DEFENSE",
+        "bg_badge": "rgba(125, 207, 255, 0.15)",
+        "border": "#7dcfff"
+      },
+      "purple_analyst": {
+        "hex": "#bb9af7",
+        "label": "ANALYST / PURPLE",
+        "bg_badge": "rgba(187, 154, 247, 0.15)",
+        "border": "#bb9af7"
+      }
+    },
+    "severity": {
+      "critical": {
+        "hex": "#db4b4b",
+        "bg": "rgba(219, 75, 75, 0.2)",
+        "text": "#ff7a7a"
+      },
+      "high": {
+        "hex": "#f7768e",
+        "bg": "rgba(247, 118, 142, 0.2)",
+        "text": "#f7768e"
+      },
+      "medium": {
+        "hex": "#e0af68",
+        "bg": "rgba(224, 175, 104, 0.2)",
+        "text": "#e0af68"
+      },
+      "low": {
+        "hex": "#9ece6a",
+        "bg": "rgba(158, 206, 106, 0.2)",
+        "text": "#9ece6a"
+      }
+    },
+    "status": {
+      "healthy_online": "#9ece6a",
+      "warning_drift": "#e0af68",
+      "critical_offline": "#db4b4b",
+      "info_syncing": "#0db9d7"
+    }
+  },
+  "typography": {
+    "fonts": {
+      "mono": "JetBrains Mono, Fira Code, Source Code Pro, monospace",
+      "sans": "IBM Plex Sans, Chivo, Outfit, sans-serif"
+    },
+    "rules": "Use monospace for hex hashes, tool versions, IP addresses, CLI snippets, timestamps, CVE IDs, and workstation hostnames. Use crisp sans-serif for UI labels, table headers, menu items, and explanatory documentation."
+  },
+  "spacing_and_layout": {
+    "grid_mode": "MODE B: High Density Terminal Grid",
+    "container_padding": "p-3 sm:p-4 md:p-6",
+    "card_padding": "p-3 sm:p-4",
+    "gap": "gap-3 sm:gap-4 md:gap-5",
+    "radius": "rounded-sm md:rounded-md (max 6px radius for sharp IDE aesthetic)"
+  },
+  "key_features_layout": {
+    "auth_login": {
+      "style": "Hardened Terminal Login",
+      "elements": "JWT Auth form, HMAC signature indicator, daemon connection status, CLI curl login snippet display with one-click copy."
+    },
+    "fleet_overview": {
+      "style": "High-Density Data Grid & Matrix",
+      "elements": "Workstation table (Hostname, OS [Nix/Win DSC], Profile badge [Red/Blue/Analyst], Agent version, Tool count, CVE count badge, Last Heartbeat, Drift status), Search bar with syntax filters (e.g. 'profile:red status:drift'), Bulk action triggers."
+    },
+    "workstation_detail": {
+      "style": "Split-Pane Diagnostic Workstation View",
+      "elements": "System metadata banner, Installed Tools + Version matrix, Nix Flake hash / PowerShell DSC drift diff inspector, Profile switch trigger, Audit log timeline with CLI event details."
+    },
+    "cve_alerts": {
+      "style": "Vulnerability Intelligence Feed",
+      "elements": "CVSS score filter buttons, Matched CVE table, Affected tool & fleet count, Severity badges, CVE details drawer with remediation command (`sec-master patch --cve CVE-2026-8812`)."
+    },
+    "profile_distribution": {
+      "style": "Fleet Health & Profile Breakdown Panel",
+      "elements": "Red/Blue/Analyst ratio bars, OS distribution (Linux Flake vs Windows DSC), Agent version compliance chart, Configuration drift gauges."
+    },
+    "signed_releases": {
+      "style": "Flake Output & Cryptographic Artifact Stream",
+      "elements": "Git commit SHA, GPG signature status, Flake release version tags, Changelog modal, Rollback CLI trigger."
+    },
+    "enrollment": {
+      "style": "Token Generator & Command Provisioner",
+      "elements": "One-time enrollment JWT token generator, auto-generated Bash (`nix run github:sec-master/flake#enroll -- --token ...`) and PowerShell (`Invoke-SecurityMasterEnroll.ps1 -Token ...`) snippets, countdown expiration timer, copy button."
+    },
+    "cli_action_drawer": {
+      "style": "Universal Command Palette & CLI Mirror",
+      "elements": "Cmd+K command launcher, slide-over drawer showing exact equivalent CLI command for whatever UI action is selected or hovered, copy command to clipboard, bash/zsh/powershell syntax toggle."
+    }
+  },
+  "component_guidelines": {
+    "tables": "Dense, crisp borders (`border-[#3b4261]`), hover row highlight (`bg-[#292e42]`), sticky header with dark background, monospace cells, status indicator dot.",
+    "buttons": "Pill or sharp rectangular buttons with subtle border (`border-[#3b4261]`), active glow, monospace keyboard hint badges (e.g., `[ENTER]`, `[ESC]`, `[CMD+K]`).",
+    "cards": "Subtle 1px border (`border-[#3b4261]`), background `#24283b`, top-right CLI copy shortcut icon, crisp padding.",
+    "modals_drawers": "Dark glass background with `backdrop-blur-md bg-[#1f2335]/95`, sharp 1px border, terminal prompt headers (`sec-master:~$`).",
+    "toasts": "Use Sonner with dark terminal styling (`bg-[#15161e] border-[#3b4261] text-[#c0caf5] font-mono`)."
+  },
+  "data_testid_manifest": {
+    "auth": [
+      "login-username-input",
+      "login-password-input",
+      "login-submit-button",
+      "cli-login-snippet"
+    ],
+    "navigation": [
+      "nav-fleet-overview",
+      "nav-workstation-detail",
+      "nav-cve-alerts",
+      "nav-profile-distribution",
+      "nav-signed-releases",
+      "nav-enroll-workstation",
+      "nav-command-palette"
+    ],
+    "fleet_overview": [
+      "fleet-search-input",
+      "fleet-profile-filter-all",
+      "fleet-profile-filter-red",
+      "fleet-profile-filter-blue",
+      "fleet-profile-filter-analyst",
+      "fleet-table-row",
+      "fleet-workstation-link",
+      "fleet-switch-profile-btn"
+    ],
+    "workstation_detail": [
+      "ws-detail-hostname",
+      "ws-detail-profile-badge",
+      "ws-detail-switch-profile-trigger",
+      "ws-detail-tool-table",
+      "ws-detail-drift-diff-toggle",
+      "ws-detail-audit-timeline"
+    ],
+    "cve_alerts": [
+      "cve-severity-filter-critical",
+      "cve-severity-filter-high",
+      "cve-table-row",
+      "cve-remediate-btn",
+      "cve-cli-command-preview"
+    ],
+    "enrollment": [
+      "enroll-generate-token-btn",
+      "enroll-token-value",
+      "enroll-copy-bash-cmd",
+      "enroll-copy-powershell-cmd",
+      "enroll-expiration-timer"
+    ],
+    "cli_drawer": [
+      "cli-drawer-toggle",
+      "cli-command-output",
+      "cli-command-copy-btn",
+      "cli-palette-input"
+    ]
+  },
+  "instructions_to_main_agent": [
+    "Build the dashboard using React + Tailwind CSS + Lucide icons + Recharts + Shadcn UI primitives.",
+    "Implement light/dark theme support or default to high-density Dark Terminal mode (Tokyo Night theme).",
+    "Maintain strict CLI-first paradigm: Every interactive action, card, or modal MUST display its equivalent CLI command (e.g. `sec-master ...`).",
+    "Ensure all interactive elements have their corresponding `data-testid` attributes attached.",
+    "Mobile-first responsive design: Mobile displays high-density stacked cards with expandable drawers, desktop displays multi-panel IDE layouts.",
+    "Use mock data that simulates real Linux Nix Flake & Windows PowerShell DSC fleet states, CVE vulnerabilities (CVSS 9.8, etc.), and cryptographically signed releases.",
+    "Include toast notifications using sonner when commands are copied or actions are dispatched."
+  ]
+}

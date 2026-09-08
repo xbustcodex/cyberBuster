@@ -1,0 +1,2 @@
+/* App-level overrides — theme lives in index.css */
+.App { min-height: 100vh; background: var(--bg-main); }

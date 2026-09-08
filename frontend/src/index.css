@@ -1,0 +1,133 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+
+:root {
+    --bg-main: #1a1b26;
+    --bg-sidebar: #1f2335;
+    --bg-card: #24283b;
+    --bg-card-hover: #292e42;
+    --bg-terminal: #15161e;
+    --bg-input: #16161e;
+    --border-subtle: #3b4261;
+    --border-accent: #7aa2f7;
+    --border-focus: #bb9af7;
+    --text-primary: #c0caf5;
+    --text-secondary: #a9b1d6;
+    --text-muted: #565f89;
+    --text-highlight: #ffffff;
+
+    --red-offense: #f7768e;
+    --blue-defense: #7dcfff;
+    --purple-analyst: #bb9af7;
+
+    --sev-critical: #db4b4b;
+    --sev-high: #f7768e;
+    --sev-medium: #e0af68;
+    --sev-low: #9ece6a;
+
+    --status-online: #9ece6a;
+    --status-drift: #e0af68;
+    --status-offline: #db4b4b;
+    --status-info: #0db9d7;
+}
+
+@layer base {
+    :root {
+        --background: 229 20% 13%;
+        --foreground: 226 64% 88%;
+        --card: 229 24% 19%;
+        --card-foreground: 226 64% 88%;
+        --popover: 229 24% 19%;
+        --popover-foreground: 226 64% 88%;
+        --primary: 219 89% 72%;
+        --primary-foreground: 229 20% 13%;
+        --secondary: 230 21% 24%;
+        --secondary-foreground: 226 64% 88%;
+        --muted: 230 21% 24%;
+        --muted-foreground: 228 20% 44%;
+        --accent: 230 21% 28%;
+        --accent-foreground: 226 64% 88%;
+        --destructive: 0 62% 55%;
+        --destructive-foreground: 226 64% 96%;
+        --border: 229 24% 30%;
+        --input: 229 24% 22%;
+        --ring: 261 84% 76%;
+        --radius: 0.25rem;
+    }
+}
+
+* { border-color: hsl(var(--border)); }
+
+html, body, #root {
+    background: var(--bg-main);
+    color: var(--text-primary);
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    margin: 0;
+    min-height: 100vh;
+}
+
+.font-mono, code, pre, kbd, .mono {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Menlo', monospace;
+    font-feature-settings: 'liga' 0, 'calt' 0;
+}
+
+/* Grain texture overlay */
+.grain::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2'/%3E%3CfeColorMatrix values='0 0 0 0 0.05 0 0 0 0 0.05 0 0 0 0 0.09 0 0 0 0.35 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    opacity: 0.35;
+    z-index: 1;
+    mix-blend-mode: overlay;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-main); }
+::-webkit-scrollbar-thumb { background: var(--border-subtle); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-accent); }
+
+/* Terminal prompt line */
+.term-prompt::before {
+    content: 'sec-master:~$ ';
+    color: var(--purple-analyst);
+    font-family: 'JetBrains Mono', monospace;
+    margin-right: 0.4rem;
+}
+
+/* Blink cursor */
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+.cursor::after {
+    content: '▊';
+    color: var(--purple-analyst);
+    animation: blink 1s steps(1) infinite;
+    margin-left: 2px;
+}
+
+/* Data cell */
+.data-cell { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-primary); }
+
+/* Severity dot */
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; box-shadow: 0 0 8px currentColor; }
+
+/* Focus ring override */
+*:focus-visible { outline: 1px solid var(--border-focus); outline-offset: 2px; }
+
+/* Selection */
+::selection { background: rgba(187, 154, 247, 0.35); color: var(--text-highlight); }
+
+/* Slide-up entrance */
+@keyframes slideUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+.enter { animation: slideUp 0.24s ease-out both; }
+
+/* Table hover */
+tbody tr.row-hover:hover { background: var(--bg-card-hover); }
+
+/* Sticky header shadow */
+.sticky-head { position: sticky; top: 0; background: var(--bg-terminal); z-index: 5; }
