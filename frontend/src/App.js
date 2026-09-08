@@ -12,6 +12,7 @@ import SignedReleases from "@/pages/SignedReleases";
 import EnrollWorkstation from "@/pages/Enroll";
 import Plugins from "@/pages/Plugins";
 import SigmaImport from "@/pages/SigmaImport";
+import Automations from "@/pages/Automations";
 
 function Protected({ children }) {
   const { user } = useAuth();
@@ -52,6 +53,7 @@ export default function App() {
           <Route path="/releases" element={<Protected><SignedReleases /></Protected>} />
           <Route path="/plugins" element={<Protected><Plugins /></Protected>} />
           <Route path="/sigma" element={<Protected><SigmaImport /></Protected>} />
+          <Route path="/automations" element={<Protected><Automations /></Protected>} />
           <Route path="/enroll" element={<Protected><EnrollWorkstation /></Protected>} />
           <Route path="*" element={<Navigate to="/fleet" replace />} />
         </Routes>

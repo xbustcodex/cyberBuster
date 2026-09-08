@@ -33,7 +33,11 @@ import seed as seedmod
 import plugins as sm_plugins
 from plugins.crypto import encrypt as sm_encrypt, mask as sm_mask
 import sigma_parser
+import sigma_sync
+import marketplace
+import scheduler as sm_scheduler
 import asyncio
+from fastapi import Response as FastResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
 log = logging.getLogger("secmaster")
@@ -941,6 +945,298 @@ async def sigma_import(request: Request, user=Depends(get_current_user)):
 
 
 # ============================================================
+# AUTOMATIONS — Scheduled bulk sweeps, Sigma repo sync, Marketplace subscriptions
+# ============================================================
+def _serialize_schedule(s: dict) -> dict:
+    return {k: v for k, v in s.items() if k != "_id"}
+
+
+@api.get("/schedules")
+async def list_schedules(_user=Depends(get_current_user)):
+    docs = await db.schedules.find({}).sort("created_at", -1).to_list(200)
+    return [_serialize_schedule(d) for d in docs]
+
+
+@api.post("/schedules")
+async def create_schedule(request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    scope = body.get("scope", "online")
+    if scope not in ("online", "all"):
+        raise HTTPException(400, "scope must be 'online' or 'all'")
+    interval = int(body.get("interval_hours") or 24)
+    if interval < 1 or interval > 24 * 30:
+        raise HTTPException(400, "interval_hours must be between 1 and 720")
+    doc = {
+        "id": secrets.token_hex(10),
+        "kind": "bulk_sweep",
+        "name": body.get("name") or f"nightly {scope} sweep",
+        "enabled": bool(body.get("enabled", True)),
+        "interval_hours": interval,
+        "scope": scope,
+        "created_by": user.get("email"),
+        "created_at": _now(),
+        "last_run_at": None,
+        "last_run_status": None,
+    }
+    await db.schedules.insert_one(doc)
+    return _serialize_schedule(doc)
+
+
+@api.patch("/schedules/{sched_id}")
+async def patch_schedule(sched_id: str, request: Request, _user=Depends(get_current_user)):
+    body = await request.json()
+    updates: dict = {}
+    for k in ("name", "enabled", "scope"):
+        if k in body:
+            updates[k] = body[k]
+    if "interval_hours" in body:
+        v = int(body["interval_hours"])
+        if v < 1 or v > 24 * 30:
+            raise HTTPException(400, "interval_hours must be between 1 and 720")
+        updates["interval_hours"] = v
+    if not updates:
+        raise HTTPException(400, "Nothing to update")
+    res = await db.schedules.update_one({"id": sched_id}, {"$set": updates})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Schedule not found")
+    doc = await db.schedules.find_one({"id": sched_id})
+    return _serialize_schedule(doc)
+
+
+@api.delete("/schedules/{sched_id}")
+async def delete_schedule(sched_id: str, _user=Depends(get_current_user)):
+    res = await db.schedules.delete_one({"id": sched_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Schedule not found")
+    return {"ok": True}
+
+
+async def _run_scheduled_bulk_sweep(job: dict) -> dict:
+    scope = job.get("scope", "online")
+    vt = await _find_enabled_query_plugin("virustotal")
+    sh = await _find_enabled_query_plugin("shodan")
+    if not vt and not sh:
+        return {"skipped": True, "reason": "no query provider enabled"}
+    query: dict = {}
+    if scope == "online":
+        query["status"] = "online"
+    workstations = await db.workstations.find(query, {"_id": 0}).to_list(200)
+    total, hosts = 0, 0
+    for ws in workstations:
+        if not ws.get("ip_address"):
+            continue
+        r = await _run_ioc_for_workstation(ws)
+        total += r["count"]
+        hosts += 1
+    return {"scope": scope, "hosts_swept": hosts, "total_lookups": total}
+
+
+@api.post("/schedules/{sched_id}/run-now")
+async def run_schedule_now(sched_id: str, _user=Depends(get_current_user)):
+    job = await db.schedules.find_one({"id": sched_id})
+    if not job:
+        raise HTTPException(404, "Schedule not found")
+    result = await _run_scheduled_bulk_sweep(job)
+    await db.schedules.update_one({"id": sched_id}, {"$set": {
+        "last_run_at": _now(), "last_run_status": "ok", "last_run_meta": result,
+    }})
+    return {"ok": True, **result}
+
+
+# ---------- Sigma sources ----------
+@api.get("/sigma-sources")
+async def list_sigma_sources(_user=Depends(get_current_user)):
+    docs = await db.sigma_sources.find({}).sort("created_at", -1).to_list(200)
+    return [_serialize_schedule(d) for d in docs]
+
+
+@api.post("/sigma-sources")
+async def create_sigma_source(request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    github_url = (body.get("github_url") or "").strip()
+    if not github_url:
+        raise HTTPException(400, "github_url required")
+    try:
+        sigma_sync.parse_repo_url(github_url)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    scope = body.get("scope") or "all-online"
+    if scope not in ("all-online", "all"):
+        raise HTTPException(400, "scope must be 'all-online' or 'all'")
+    interval = int(body.get("interval_hours") or 24)
+    doc = {
+        "id": secrets.token_hex(10),
+        "name": body.get("name") or github_url.rstrip("/").split("/")[-1] or "sigma-source",
+        "github_url": github_url,
+        "scope": scope,
+        "enabled": bool(body.get("enabled", True)),
+        "interval_hours": interval,
+        "created_by": user.get("email"),
+        "created_at": _now(),
+        "last_run_at": None,
+        "last_run_status": None,
+    }
+    await db.sigma_sources.insert_one(doc)
+    return _serialize_schedule(doc)
+
+
+@api.patch("/sigma-sources/{src_id}")
+async def patch_sigma_source(src_id: str, request: Request, _user=Depends(get_current_user)):
+    body = await request.json()
+    updates: dict = {}
+    for k in ("name", "enabled", "scope", "github_url"):
+        if k in body:
+            updates[k] = body[k]
+    if "interval_hours" in body:
+        updates["interval_hours"] = int(body["interval_hours"])
+    if not updates:
+        raise HTTPException(400, "Nothing to update")
+    res = await db.sigma_sources.update_one({"id": src_id}, {"$set": updates})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Sigma source not found")
+    doc = await db.sigma_sources.find_one({"id": src_id})
+    return _serialize_schedule(doc)
+
+
+@api.delete("/sigma-sources/{src_id}")
+async def delete_sigma_source(src_id: str, _user=Depends(get_current_user)):
+    res = await db.sigma_sources.delete_one({"id": src_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Sigma source not found")
+    return {"ok": True}
+
+
+@api.post("/sigma-sources/{src_id}/sync-now")
+async def sync_sigma_source_now(src_id: str, _user=Depends(get_current_user)):
+    src = await db.sigma_sources.find_one({"id": src_id})
+    if not src:
+        raise HTTPException(404, "Sigma source not found")
+    try:
+        result = await sigma_sync.sync_source(db, src)
+    except Exception as e:
+        await db.sigma_sources.update_one({"id": src_id}, {"$set": {
+            "last_run_at": _now(), "last_run_status": "error",
+            "last_run_meta": {"error": f"{e.__class__.__name__}: {e}"[:400]},
+        }})
+        raise HTTPException(502, f"sync failed: {e}")
+    await db.sigma_sources.update_one({"id": src_id}, {"$set": {
+        "last_run_at": _now(), "last_run_status": "ok", "last_run_meta": result,
+    }})
+    return {"ok": True, **result}
+
+
+# ---------- Marketplace (own feed + subscriptions) ----------
+@api.get("/marketplace/info")
+async def marketplace_info(request: Request, _user=Depends(get_current_user)):
+    cfg = await marketplace.get_or_create_config(db)
+    base = str(request.base_url).rstrip("/")
+    feed_url = f"{base}/api/marketplace/feed?fid={cfg['feed_id']}"
+    return {
+        "feed_id": cfg["feed_id"],
+        "signing_key": cfg["signing_key"],
+        "feed_url": feed_url,
+        "created_at": cfg.get("created_at"),
+        "rotated_at": cfg.get("rotated_at"),
+    }
+
+
+@api.post("/marketplace/rotate-key")
+async def marketplace_rotate(_user=Depends(get_current_user)):
+    cfg = await marketplace.rotate_signing_key(db)
+    return {"ok": True, "signing_key": cfg["signing_key"]}
+
+
+@api.get("/marketplace/feed")
+async def marketplace_feed(fid: Optional[str] = None):
+    """PUBLIC endpoint — served without auth so other dashboards can subscribe."""
+    cfg = await marketplace.get_or_create_config(db)
+    if fid and fid != cfg["feed_id"]:
+        raise HTTPException(404, "unknown feed_id")
+    body, sig = await marketplace.build_feed(db)
+    body["_signature"] = sig  # inline for clients that can't read headers
+    resp = FastResponse(
+        content=json.dumps(body, sort_keys=True),
+        media_type="application/json",
+        headers={"X-SecMaster-Signature": sig, "Cache-Control": "public, max-age=60"},
+    )
+    return resp
+
+
+@api.get("/marketplace/subscriptions")
+async def list_subscriptions(_user=Depends(get_current_user)):
+    docs = await db.marketplace_subscriptions.find({}).sort("created_at", -1).to_list(200)
+    return [_serialize_schedule(d) for d in docs]
+
+
+@api.post("/marketplace/subscriptions")
+async def create_subscription(request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    feed_url = (body.get("feed_url") or "").strip()
+    if not feed_url.startswith(("http://", "https://")):
+        raise HTTPException(400, "feed_url must be an http(s) URL")
+    doc = {
+        "id": secrets.token_hex(10),
+        "name": body.get("name") or "peer-feed",
+        "feed_url": feed_url,
+        "signing_key": body.get("signing_key") or None,
+        "enabled": bool(body.get("enabled", True)),
+        "interval_hours": int(body.get("interval_hours") or 24),
+        "created_by": user.get("email"),
+        "created_at": _now(),
+        "last_run_at": None,
+        "last_run_status": None,
+    }
+    await db.marketplace_subscriptions.insert_one(doc)
+    return _serialize_schedule(doc)
+
+
+@api.patch("/marketplace/subscriptions/{sub_id}")
+async def patch_subscription(sub_id: str, request: Request, _user=Depends(get_current_user)):
+    body = await request.json()
+    updates: dict = {}
+    for k in ("name", "enabled", "feed_url", "signing_key"):
+        if k in body:
+            updates[k] = body[k]
+    if "interval_hours" in body:
+        updates["interval_hours"] = int(body["interval_hours"])
+    if not updates:
+        raise HTTPException(400, "Nothing to update")
+    res = await db.marketplace_subscriptions.update_one({"id": sub_id}, {"$set": updates})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Subscription not found")
+    doc = await db.marketplace_subscriptions.find_one({"id": sub_id})
+    return _serialize_schedule(doc)
+
+
+@api.delete("/marketplace/subscriptions/{sub_id}")
+async def delete_subscription(sub_id: str, _user=Depends(get_current_user)):
+    res = await db.marketplace_subscriptions.delete_one({"id": sub_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Subscription not found")
+    await db.plugin_templates.delete_many({"subscription_id": sub_id})
+    return {"ok": True}
+
+
+@api.post("/marketplace/subscriptions/{sub_id}/sync-now")
+async def sync_subscription_now(sub_id: str, _user=Depends(get_current_user)):
+    sub = await db.marketplace_subscriptions.find_one({"id": sub_id})
+    if not sub:
+        raise HTTPException(404, "Subscription not found")
+    try:
+        result = await marketplace.verify_and_import_subscription(db, sub)
+    except Exception as e:
+        await db.marketplace_subscriptions.update_one({"id": sub_id}, {"$set": {
+            "last_run_at": _now(), "last_run_status": "error",
+            "last_run_meta": {"error": f"{e.__class__.__name__}: {e}"[:400]},
+        }})
+        raise HTTPException(502, f"sync failed: {e}")
+    await db.marketplace_subscriptions.update_one({"id": sub_id}, {"$set": {
+        "last_run_at": _now(), "last_run_status": "ok", "last_run_meta": result,
+    }})
+    return {"ok": True, **result}
+
+
+# ============================================================
 # HEALTH
 # ============================================================
 @api.get("/")
@@ -971,6 +1267,9 @@ async def startup():
     await db.plugin_executions.create_index("plugin_id")
     await db.plugin_templates.create_index("name", unique=True)
     await db.ioc_lookups.create_index([("workstation_id", 1), ("at", -1)])
+    await db.schedules.create_index("id", unique=True)
+    await db.sigma_sources.create_index("id", unique=True)
+    await db.marketplace_subscriptions.create_index("id", unique=True)
 
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@secmaster.io").lower()
     admin_pw = os.environ.get("ADMIN_PASSWORD", "admin1234")
@@ -997,6 +1296,24 @@ async def startup():
             await db.audit.insert_many(audit)
         log.info("Seeded fleet: %d workstations, %d CVEs, %d releases",
                  len(workstations), len(cves), len(releases))
+
+    # Bootstrap marketplace signing config so /api/marketplace/feed is ready.
+    await marketplace.get_or_create_config(db)
+
+    # Kick off the background scheduler (bulk sweeps + sigma sync + marketplace pulls).
+    async def _sync_marketplace(job: dict) -> dict:
+        return await marketplace.verify_and_import_subscription(db, job)
+
+    async def _sync_sigma(job: dict) -> dict:
+        return await sigma_sync.sync_source(db, job)
+
+    asyncio.create_task(sm_scheduler.run_scheduler(
+        db,
+        run_bulk_sweep=_run_scheduled_bulk_sweep,
+        run_sigma_sync=_sync_sigma,
+        run_marketplace_sync=_sync_marketplace,
+    ))
+    log.info("Background scheduler task spawned")
 
 
 @app.on_event("shutdown")

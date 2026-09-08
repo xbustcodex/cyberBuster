@@ -1,7 +1,7 @@
 import { useState, useEffect, createContext, useContext } from "react";
 import { NavLink, useNavigate, useLocation } from "react-router-dom";
 import {
-  Server, ShieldAlert, Layers, Rocket, KeyRound, Plug, FileCode,
+  Server, ShieldAlert, Layers, Rocket, KeyRound, Plug, FileCode, Clock,
   Terminal, LogOut, Activity, Search,
 } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
@@ -19,6 +19,7 @@ const NAV_ITEMS = [
   { to: "/releases", label: "signed-releases", icon: Rocket, testId: NAV.releases, cmd: "sec-master releases --verify-sig" },
   { to: "/plugins", label: "plugins", icon: Plug, testId: "nav-plugins", cmd: "sec-master plugin list" },
   { to: "/sigma", label: "sigma-import", icon: FileCode, testId: "nav-sigma", cmd: "sec-master sigma import" },
+  { to: "/automations", label: "automations", icon: Clock, testId: "nav-automations", cmd: "sec-master automations list" },
   { to: "/enroll", label: "enroll-workstation", icon: KeyRound, testId: NAV.enroll, cmd: "sec-master enroll --generate-token" },
 ];
 
