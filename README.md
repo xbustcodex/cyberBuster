@@ -199,27 +199,70 @@ email:    admin@secmaster.io
 password: admin1234
 ```
 
-The backend also seeds **12 workstations, 8 CVEs, 5 signed releases** so the
-UI is meaningful on first login.
+On first boot the backend seeds **12 sample workstations, 8 CVEs and 5
+releases** so the UI is not empty. Everything seeded is flagged `demo: true`,
+rendered with a yellow **DEMO** tag, and a banner offers **purge demo data**
+(`DELETE /api/demo-data` · `sec-master demo purge`). Once purged it never
+re-seeds. Real hosts, real CVEs and real releases are never touched.
 
 ### Agent enrollment (any real Linux / Windows host)
 
-```bash
-# Linux
-curl -sSL https://your-dashboard/api/agent/bootstrap.sh | \
-  ENROLL_TOKEN="<one-time-token>" HOSTNAME="hydra-red-01" bash
+Generate a one-time token on **enroll-workstation** (or `sec-master enroll
+generate --hostname h --os nixos`), then run the printed one-liner on the host:
 
-# Windows (PowerShell)
+```bash
+# Linux / NixOS
+curl -fsSL https://your-dashboard/api/agent/bootstrap.sh | \
+  ENROLL_TOKEN="<one-time-token>" SM_HOSTNAME="hydra-red-01" bash
+
+# Windows (elevated PowerShell)
+$env:ENROLL_TOKEN="<one-time-token>"; $env:SM_HOSTNAME="chimera-blue-01"
 iwr https://your-dashboard/api/agent/bootstrap.ps1 -UseB | iex
-Invoke-SMEnroll -Token "<one-time-token>" -Hostname "chimera-blue-01"
 ```
 
-Or run the built-in simulator without touching a real host:
+What the bootstrap does: downloads `agent.py` from the dashboard, POSTs the
+token to `/api/agent/enroll`, stores the agent bearer (`0600`), and installs a
+daemon — systemd unit on Linux, transient `systemd-run` unit on NixOS (persist
+with `services.sec-master-agent` from `nixosModules.agent`), Scheduled Task on
+Windows. The daemon heartbeats every 60 s with **detected tool versions**
+(`tool --version` for ~40 known binaries), the sha256 of `/etc/nixos/flake.lock`
+/ the DSC module, and the local IP.
+
+**Profile switches are real.** Switching a host in the UI sets
+`desired_profile`; the host shows **drift** until the agent's next heartbeat,
+when it runs `nixos-rebuild switch --specialisation <p>` (NixOS) or
+`Set-SMProfile -Profile <p>` (Windows) — override with `SM_SWITCH_CMD` — and
+reports the applied profile back. Hosts with no heartbeat for
+`OFFLINE_AFTER_SECONDS` (default 300) flip to **offline**.
+
+### Operator CLI
 
 ```bash
-python3 infrastructure/agent/agent.py --simulate 5 \
-  --dashboard http://localhost:8001
+curl -fsSL https://your-dashboard/api/agent/sec-master -o /usr/local/bin/sec-master && chmod +x /usr/local/bin/sec-master
+sec-master login --dashboard https://your-dashboard --email admin@secmaster.io
+sec-master fleet list                      # hostname / profile / pending / status / tools / heartbeat
+sec-master fleet switch hydra-red-01 offense
+sec-master cve sync && sec-master cve list --severity high
+sec-master releases sync
 ```
+
+### Live CVE feed (NVD)
+
+`POST /api/cves/sync` (also a built-in daily schedule) queries NVD 2.0 with
+`virtualMatchString=cpe:2.3:a:*:<tool>` for every tool reported by any agent,
+walks the CPE `versionStart*/versionEnd*` ranges against the **installed**
+versions and stores advisories with per-host match counts. Set `NVD_API_KEY`
+in `backend/.env` for the 50 req/30 s tier. CPE product names are matched by
+name — expect occasional vendor collisions (e.g. a Ruby `curl` gem).
+
+### Signed releases (GitHub)
+
+`GITHUB_RELEASES_REPO` (default `xbustcodex/cyberBuster`) is pulled via the
+GitHub Releases API. `.github/workflows/release.yml` fires on `v*` tags: tars
+`infrastructure/`, signs it with **cosign keyless (GitHub OIDC)** and uploads
+`.tar.gz` + `.sha256` + `.bundle`. A release is shown as **signed** when a
+sigstore/cosign asset is attached; the manifest modal prints the exact
+`cosign verify-blob` command.
 
 ### NixOS install (Phase 1)
 
@@ -289,6 +332,7 @@ Set-SMProfile analyst
 ├── infrastructure/         # Phase 1-2 static artifacts
 │   ├── nix/
 │   │   ├── flake.nix
+│   │   ├── modules/agent.nix   # services.sec-master-agent
 │   │   └── profiles/
 │   │       ├── offense.nix
 │   │       ├── defense.nix
@@ -296,8 +340,13 @@ Set-SMProfile analyst
 │   ├── windows/
 │   │   ├── SecurityMaster.psm1
 │   │   └── profiles.dsc.ps1
-│   └── agent/
-│       └── agent.py        # --enroll · --heartbeat · --simulate
+│   ├── agent/
+│   │   └── agent.py        # --enroll · --heartbeat · --once (real tool detection, applies profile switches)
+│   └── cli/
+│       └── sec-master      # operator CLI (stdlib only) — served at /api/agent/sec-master
+│
+├── .github/workflows/
+│   └── release.yml         # v* tag → tar + cosign keyless sign → GitHub release
 │
 ├── memory/
 │   ├── PRD.md              # product spec + backlog
@@ -323,17 +372,19 @@ Set-SMProfile analyst
 - `POST   /api/workstations/{id}/switch-profile`
 - `DELETE /api/workstations/{id}`
 
-### Enrollment
-- `POST /api/enroll/generate` (authed → one-time token)
+### Enrollment / Agent
+- `POST /api/enroll/generate` (authed → one-time token + bash/powershell one-liners)
 - `POST /api/agent/enroll` (agent → exchanges token for bearer)
-- `POST /api/agent/heartbeat` (agent bearer required)
+- `POST /api/agent/heartbeat` (agent bearer; returns `desired_profile`)
+- `GET  /api/agent/bootstrap.sh` · `bootstrap.ps1` · `agent.py` · `SecurityMaster.psm1` · `sec-master` (public artifacts)
 
-### CVE / Stats / Audit / Releases
-- `GET  /api/cves` (`severity` filter)
-- `POST /api/cves/rescan`
-- `GET  /api/releases`
-- `GET  /api/stats/overview`
+### CVE / Releases / Stats / Audit / Demo
+- `GET  /api/cves` (`severity` filter) · `POST /api/cves/rescan`
+- `POST /api/cves/sync` (NVD, background) · `GET /api/cves/sync-status`
+- `GET  /api/releases` · `POST /api/releases/sync` (GitHub) · `GET /api/releases/status`
+- `GET  /api/stats/overview` (includes `demo` counts + `real_total`)
 - `GET  /api/audit`
+- `GET  /api/demo-data/status` · `DELETE /api/demo-data`
 
 ### Plugins & Templates
 - `GET/POST /api/plugins`
@@ -405,8 +456,9 @@ Palette: Tokyo Night. Fonts: JetBrains Mono for data, IBM Plex Sans for chrome.
 
 ## Roadmap
 
-- **P0 · Phase 3:** GitHub Actions build pipeline + cosign signing job
-- **P1 · Phase 5:** Live NVD CVE feed sync (currently seeded)
+- ~~P0 · Phase 3: GitHub Actions build pipeline + cosign signing job~~ — shipped (`.github/workflows/release.yml`)
+- ~~P1 · Phase 5: Live NVD CVE feed sync~~ — shipped (`backend/nvd.py`)
+- **P1:** Verify cosign bundles server-side (currently: signed = sigstore asset attached)
 - **P1:** Reproducibility verification (`nix build --check` on cron)
 - **P1:** Container-based offense sandbox as a fourth profile mode
 - **P1:** MFA / WebAuthn for dashboard operators

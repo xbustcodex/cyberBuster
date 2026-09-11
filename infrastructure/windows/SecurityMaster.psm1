@@ -44,24 +44,51 @@ function Set-SMProfile {
   foreach ($pkg in $cfg.WingetInstall)  { winget install --id $pkg --silent --accept-package-agreements }
 
   [Environment]::SetEnvironmentVariable("SM_PROFILE", $Profile, "Machine")
+  $stateDir = if ($env:SM_STATE_DIR) { $env:SM_STATE_DIR } else { Join-Path $env:ProgramData "SecMaster" }
+  New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+  Set-Content -Path (Join-Path $stateDir "profile") -Value $Profile -NoNewline
   Write-Host "[sec-master] profile applied. reboot recommended." -ForegroundColor Green
 }
 
 function Invoke-SMEnroll {
+  <# Enroll this host. Prefer the bootstrap: iwr <dashboard>/api/agent/bootstrap.ps1 -UseB | iex #>
   param(
     [Parameter(Mandatory)][string]$Token,
     [Parameter(Mandatory)][string]$Hostname,
-    [string]$DashboardUrl = "https://hardened-analyst.preview.emergentagent.com"
+    [Parameter(Mandatory)][string]$DashboardUrl
   )
-  $body = @{ token = $Token; hostname = $Hostname; os = "windows"; profile = "analyst"; agent_version = "0.1.0" } | ConvertTo-Json
-  $resp = Invoke-RestMethod -Uri "$DashboardUrl/api/agent/enroll" -Method POST -Body $body -ContentType "application/json"
-  [Environment]::SetEnvironmentVariable("SM_AGENT_TOKEN", $resp.agent_token, "Machine")
-  Write-Host "[sec-master] enrolled. workstation_id=$($resp.workstation_id)"
+  $env:ENROLL_TOKEN = $Token
+  $env:SM_HOSTNAME = $Hostname
+  $env:SM_DASHBOARD = $DashboardUrl
+  Invoke-WebRequest -UseBasicParsing "$DashboardUrl/api/agent/bootstrap.ps1" | Select-Object -ExpandProperty Content | Invoke-Expression
 }
 
 function Update-SMBundle {
-  Write-Host "[sec-master] fetching signed release manifest..."
-  # verify cosign signature, then apply DSC config set
+  <# Download the latest signed release bundle and verify it with cosign (keyless / GitHub OIDC). #>
+  param(
+    [Parameter(Mandatory)][string]$DashboardUrl,
+    [string]$Repo = "xbustcodex/cyberBuster"
+  )
+  $token = [Environment]::GetEnvironmentVariable("SM_TOKEN", "Machine")
+  $headers = @{}
+  if ($token) { $headers["Authorization"] = "Bearer $token" }
+  $releases = Invoke-RestMethod -Uri "$DashboardUrl/api/releases" -Headers $headers
+  $latest = $releases | Where-Object { $_.source -eq "github" } | Select-Object -First 1
+  if (-not $latest) { Write-Host "[sec-master] no GitHub releases synced yet" -ForegroundColor Yellow; return }
+  Write-Host "[sec-master] latest release: $($latest.version) signature=$($latest.signature_status)"
+  $bundle = $latest.assets | Where-Object { $_.name -like "*.tar.gz" } | Select-Object -First 1
+  $sig    = $latest.assets | Where-Object { $_.name -like "*.bundle" } | Select-Object -First 1
+  if (-not $bundle -or -not $sig) { Write-Host "[sec-master] release has no signed bundle asset" -ForegroundColor Yellow; return }
+  $dl = Join-Path $env:TEMP "sec-master-release"
+  New-Item -ItemType Directory -Force -Path $dl | Out-Null
+  Invoke-WebRequest -UseBasicParsing $bundle.download_url -OutFile (Join-Path $dl $bundle.name)
+  Invoke-WebRequest -UseBasicParsing $sig.download_url -OutFile (Join-Path $dl $sig.name)
+  if (-not (Get-Command cosign -ErrorAction SilentlyContinue)) { throw "cosign not found: winget install sigstore.cosign" }
+  cosign verify-blob --bundle (Join-Path $dl $sig.name) `
+    --certificate-identity-regexp "https://github.com/$Repo/" `
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com (Join-Path $dl $bundle.name)
+  if ($LASTEXITCODE -ne 0) { throw "cosign verification FAILED for $($latest.version)" }
+  Write-Host "[sec-master] signature verified. bundle at $dl" -ForegroundColor Green
 }
 
 Export-ModuleMember -Function Set-SMProfile, Invoke-SMEnroll, Update-SMBundle

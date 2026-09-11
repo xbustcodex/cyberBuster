@@ -55,8 +55,8 @@ export default function FleetOverview() {
 
   const switchProfile = async (ws, next) => {
     try {
-      await api.post(`/workstations/${ws.id}/switch-profile`, { profile: next });
-      toast.success(`${ws.hostname} → ${next}`);
+      const { data } = await api.post(`/workstations/${ws.id}/switch-profile`, { profile: next });
+      toast.success(data.pending ? `${ws.hostname} → ${next} requested · agent applies on next heartbeat` : `${ws.hostname} → ${next}`);
       load();
     } catch { toast.error("Switch failed"); }
   };
@@ -158,7 +158,9 @@ export default function FleetOverview() {
               <tr><td colSpan={8} className="px-3 py-6 text-center text-[#565f89]">loading fleet …</td></tr>
             )}
             {!loading && filtered.length === 0 && (
-              <tr><td colSpan={8} className="px-3 py-6 text-center text-[#565f89]">no workstations match filter</td></tr>
+              <tr><td colSpan={8} className="px-3 py-6 text-center text-[#565f89]">
+                {rows.length === 0 ? <>no workstations enrolled yet — go to <Link to="/enroll" className="underline text-[#bb9af7]">enroll-workstation</Link> and run the one-liner on a host</> : "no workstations match filter"}
+              </td></tr>
             )}
             {filtered.map((ws) => {
               const pm = PROFILE_META[ws.profile];
@@ -168,7 +170,10 @@ export default function FleetOverview() {
                     <Link data-testid={FLEET.wsLink} to={`/fleet/${ws.id}`} className="hover:text-[#bb9af7] underline-offset-4 hover:underline">
                       {ws.hostname}
                     </Link>
-                    <div className="text-[10px] text-[#565f89]">{ws.ip_address}</div>
+                    {ws.demo && (
+                      <span data-testid="fleet-demo-tag" className="ml-2 px-1 py-px text-[9px] uppercase tracking-widest border rounded-sm" style={{ color: "var(--status-drift)", borderColor: "var(--status-drift)" }}>demo</span>
+                    )}
+                    <div className="text-[10px] text-[#565f89]">{ws.ip_address}{ws.local_ip && ws.local_ip !== ws.ip_address ? ` · lan ${ws.local_ip}` : ""}</div>
                   </td>
                   <td className="px-3 py-2 text-[#a9b1d6]">{ws.os === "nixos" ? "nixos-flake" : "win-dsc"}</td>
                   <td className="px-3 py-2">
@@ -176,6 +181,11 @@ export default function FleetOverview() {
                       className="inline-block px-2 py-0.5 text-[10px] tracking-widest border rounded-sm"
                       style={{ color: pm.color, borderColor: pm.color, background: pm.bg }}
                     >{pm.label}</span>
+                    {ws.desired_profile && ws.desired_profile !== ws.profile && (
+                      <div data-testid="fleet-pending-profile" className="mt-1 text-[9px] uppercase tracking-widest" style={{ color: "var(--status-drift)" }}>
+                        → {ws.desired_profile} pending
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-2 text-[#a9b1d6]">v{ws.agent_version}</td>
                   <td className="px-3 py-2">{ws.tools?.length ?? 0}</td>

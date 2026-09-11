@@ -36,8 +36,16 @@ import sigma_parser
 import sigma_sync
 import marketplace
 import scheduler as sm_scheduler
+import nvd
+import releases_sync
+import fleet_status
+import bootstrap
 import asyncio
 from fastapi import Response as FastResponse
+from fastapi.responses import PlainTextResponse
+
+INFRA_DIR = ROOT_DIR.parent / "infrastructure"
+PROFILES = ("offense", "defense", "analyst")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
 log = logging.getLogger("secmaster")
@@ -53,6 +61,17 @@ api = APIRouter(prefix="/api")
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _client_ip(request: Request) -> Optional[str]:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
+def _dashboard_url(request: Request) -> str:
+    return (os.environ.get("FRONTEND_URL") or str(request.base_url)).rstrip("/")
 
 
 # ============================================================
@@ -159,21 +178,32 @@ async def switch_profile(ws_id: str, body: ProfileSwitchRequest, user=Depends(ge
     if not ws:
         raise HTTPException(404, "Workstation not found")
     previous = ws["profile"]
-    await db.workstations.update_one({"id": ws_id}, {"$set": {"profile": body.profile, "status": "online"}})
+    if ws.get("demo"):
+        await db.workstations.update_one({"id": ws_id}, {"$set": {"profile": body.profile, "status": "online"}})
+        message = f"Profile switched to {body.profile} by {user['email']} (demo host — applied instantly)"
+    else:
+        await db.workstations.update_one({"id": ws_id}, {"$set": {
+            "desired_profile": body.profile,
+            "desired_profile_requested_at": _now(),
+            "desired_profile_requested_by": user["email"],
+            "status": "drift" if body.profile != previous else ws.get("status", "online"),
+        }})
+        message = f"Profile switch to {body.profile} requested by {user['email']} — agent applies on next heartbeat"
     await db.audit.insert_one({
         "id": secrets.token_hex(8),
         "workstation_id": ws_id,
         "hostname": ws["hostname"],
         "kind": "profile_switch",
-        "message": f"Profile switched to {body.profile} by {user['email']}",
+        "message": message,
         "at": _now(),
-        "meta": {"by": user["email"], "previous": previous},
+        "meta": {"by": user["email"], "previous": previous, "requested": body.profile},
     })
     await sm_plugins.dispatch(db, "workstation.profile_switched", {
         "hostname": ws["hostname"], "workstation_id": ws_id,
         "profile": body.profile, "previous": previous, "by": user["email"],
+        "pending": not ws.get("demo"),
     })
-    return {"ok": True, "profile": body.profile}
+    return {"ok": True, "profile": body.profile, "pending": not ws.get("demo"), "message": message}
 
 
 @api.delete("/workstations/{ws_id}")
@@ -182,14 +212,50 @@ async def delete_workstation(ws_id: str, _user=Depends(get_current_user)):
     if res.deleted_count == 0:
         raise HTTPException(404, "Workstation not found")
     await db.audit.delete_many({"workstation_id": ws_id})
+    await db.ioc_lookups.delete_many({"workstation_id": ws_id})
     return {"ok": True}
+
+
+# ============================================================
+# DEMO DATA — labelled sample fleet, one-click purge
+# ============================================================
+async def _demo_counts() -> dict:
+    return {
+        "workstations": await db.workstations.count_documents({"demo": True}),
+        "cves": await db.cves.count_documents({"demo": True}),
+        "releases": await db.releases.count_documents({"demo": True}),
+        "purged": bool(await db.meta.find_one({"key": "demo_purged"})),
+    }
+
+
+@api.get("/demo-data/status")
+async def demo_status(_user=Depends(get_current_user)):
+    return await _demo_counts()
+
+
+@api.delete("/demo-data")
+async def purge_demo_data(user=Depends(get_current_user)):
+    ids = [w["id"] async for w in db.workstations.find({"demo": True}, {"id": 1})]
+    r_ws = await db.workstations.delete_many({"demo": True})
+    r_cve = await db.cves.delete_many({"demo": True})
+    r_rel = await db.releases.delete_many({"demo": True})
+    r_audit = await db.audit.delete_many({"$or": [{"demo": True}, {"workstation_id": {"$in": ids}}]})
+    await db.ioc_lookups.delete_many({"workstation_id": {"$in": ids}})
+    await db.meta.update_one({"key": "demo_purged"}, {"$set": {"at": _now(), "by": user["email"]}}, upsert=True)
+    await db.cves.update_many({"source": "nvd", "matched_workstation_ids": {"$in": ids}},
+                              {"$pull": {"matched_workstation_ids": {"$in": ids}}})
+    async for c in db.cves.find({"source": "nvd"}, {"_id": 0, "cve_id": 1, "matched_workstation_ids": 1}):
+        await db.cves.update_one({"cve_id": c["cve_id"]}, {"$set": {"matched_workstations": len(c.get("matched_workstation_ids") or [])}})
+    log.info("demo data purged by %s", user["email"])
+    return {"ok": True, "workstations": r_ws.deleted_count, "cves": r_cve.deleted_count,
+            "releases": r_rel.deleted_count, "audit": r_audit.deleted_count}
 
 
 # ============================================================
 # ENROLLMENT
 # ============================================================
 @api.post("/enroll/generate", response_model=EnrollTokenOut)
-async def generate_enroll_token(body: EnrollGenerateRequest, _user=Depends(get_current_user)):
+async def generate_enroll_token(body: EnrollGenerateRequest, request: Request, _user=Depends(get_current_user)):
     token = secrets.token_urlsafe(24)
     expires = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
     await db.enroll_tokens.insert_one({
@@ -199,19 +265,45 @@ async def generate_enroll_token(body: EnrollGenerateRequest, _user=Depends(get_c
         "expires_at": expires,
         "used": False,
     })
-    backend = os.environ.get("FRONTEND_URL", "http://localhost:8001").rstrip("/")
+    backend = _dashboard_url(request)
     bash_cmd = (
-        f'curl -sSL {backend}/api/agent/bootstrap.sh | '
-        f'ENROLL_TOKEN="{token}" HOSTNAME="{body.hostname}" bash'
+        f'curl -fsSL {backend}/api/agent/bootstrap.sh | '
+        f'ENROLL_TOKEN="{token}" SM_HOSTNAME="{body.hostname}" bash'
     )
     ps_cmd = (
-        f'iwr {backend}/api/agent/bootstrap.ps1 -UseB | '
-        f'iex; Invoke-SMEnroll -Token "{token}" -Hostname "{body.hostname}"'
+        f'$env:ENROLL_TOKEN="{token}"; $env:SM_HOSTNAME="{body.hostname}"; '
+        f'iwr {backend}/api/agent/bootstrap.ps1 -UseB | iex'
     )
     return EnrollTokenOut(
         token=token, hostname=body.hostname, os=body.os,
         expires_at=expires, bash_command=bash_cmd, powershell_command=ps_cmd,
     )
+
+
+# ---------- Agent artifacts (public: fetched by hosts before they have a token) ----------
+@api.get("/agent/bootstrap.sh", response_class=PlainTextResponse)
+async def agent_bootstrap_sh(request: Request):
+    return bootstrap.render(bootstrap.BASH, _dashboard_url(request))
+
+
+@api.get("/agent/bootstrap.ps1", response_class=PlainTextResponse)
+async def agent_bootstrap_ps1(request: Request):
+    return bootstrap.render(bootstrap.POWERSHELL, _dashboard_url(request))
+
+
+@api.get("/agent/agent.py", response_class=PlainTextResponse)
+async def agent_source():
+    return (INFRA_DIR / "agent" / "agent.py").read_text()
+
+
+@api.get("/agent/SecurityMaster.psm1", response_class=PlainTextResponse)
+async def agent_psm1():
+    return (INFRA_DIR / "windows" / "SecurityMaster.psm1").read_text()
+
+
+@api.get("/agent/sec-master", response_class=PlainTextResponse)
+async def cli_source():
+    return (INFRA_DIR / "cli" / "sec-master").read_text()
 
 
 @api.post("/agent/enroll")
@@ -229,20 +321,24 @@ async def agent_enroll(request: Request):
         raise HTTPException(401, "Enroll token expired")
     ws_id = secrets.token_hex(12)
     agent_token = secrets.token_urlsafe(32)
+    profile = body.get("profile") if body.get("profile") in PROFILES else "analyst"
     ws = {
         "id": ws_id,
         "hostname": body.get("hostname") or tok["hostname"],
         "os": tok["os"],
-        "profile": body.get("profile", "analyst"),
+        "profile": profile,
+        "desired_profile": None,
         "agent_version": body.get("agent_version", "0.1.0"),
         "flake_hash": body.get("flake_hash"),
         "dsc_hash": body.get("dsc_hash"),
+        "os_release": body.get("os_release"),
         "tools": body.get("tools", []),
-        "tags": [tok["os"], body.get("profile", "analyst")],
+        "tags": [tok["os"], profile],
         "enrolled_at": _now(),
         "last_heartbeat": _now(),
         "status": "online",
-        "ip_address": request.client.host if request.client else None,
+        "ip_address": _client_ip(request),
+        "local_ip": body.get("local_ip"),
         "agent_token": agent_token,
     }
     await db.workstations.insert_one(ws)
@@ -290,12 +386,43 @@ async def agent_heartbeat(request: Request):
     if not ws:
         raise HTTPException(401, "Invalid agent token")
     body = await request.json()
-    updates = {"last_heartbeat": _now(), "status": "online"}
-    for field in ("profile", "agent_version", "flake_hash", "dsc_hash", "tools", "ip_address"):
+    updates = {"last_heartbeat": _now()}
+    for field in ("agent_version", "flake_hash", "dsc_hash", "tools", "local_ip", "os_release"):
         if field in body and body[field] is not None:
             updates[field] = body[field]
+    reported = body.get("profile") if body.get("profile") in PROFILES else ws.get("profile")
+    updates["profile"] = reported
+    updates["ip_address"] = body.get("ip_address") or _client_ip(request) or ws.get("ip_address")
+    desired = ws.get("desired_profile")
+    updates["status"] = "drift" if desired and desired != reported else "online"
+    if body.get("apply_error"):
+        updates["last_apply_error"] = {"message": str(body["apply_error"])[:300], "at": _now()}
+    elif ws.get("last_apply_error") and reported == desired:
+        updates["last_apply_error"] = None
+
+    events = []
+    if reported != ws.get("profile"):
+        events.append({"kind": "profile_switch",
+                       "message": f"Agent reported profile {reported} (was {ws.get('profile')})"
+                                  + (" — requested switch applied" if reported == desired else ""),
+                       "meta": {"previous": ws.get("profile"), "applied": reported == desired}})
+    old_tools = sorted((t.get("name"), t.get("version")) for t in ws.get("tools") or [] if isinstance(t, dict))
+    new_tools = sorted((t.get("name"), t.get("version")) for t in updates.get("tools", ws.get("tools") or []) if isinstance(t, dict))
+    if "tools" in updates and old_tools != new_tools:
+        added = len(set(new_tools) - set(old_tools)); removed = len(set(old_tools) - set(new_tools))
+        events.append({"kind": "tool_update", "message": f"Tool inventory changed (+{added} / -{removed})",
+                       "meta": {"added": added, "removed": removed, "total": len(new_tools)}})
+    if ws.get("status") == "offline":
+        events.append({"kind": "heartbeat", "message": "Agent back online", "meta": {}})
+    if body.get("apply_error") and (ws.get("last_apply_error") or {}).get("message") != str(body["apply_error"])[:300]:
+        events.append({"kind": "profile_switch", "message": f"Agent failed to apply {desired}: {str(body['apply_error'])[:160]}",
+                       "meta": {"error": True}})
+
     await db.workstations.update_one({"id": ws["id"]}, {"$set": updates})
-    return {"ok": True, "next_check_in_seconds": 60}
+    for ev in events:
+        await db.audit.insert_one({"id": secrets.token_hex(8), "workstation_id": ws["id"], "hostname": ws["hostname"],
+                                   "at": _now(), **ev})
+    return {"ok": True, "next_check_in_seconds": 60, "desired_profile": desired, "status": updates["status"]}
 
 
 # ============================================================
@@ -339,6 +466,34 @@ async def rescan_cves(_user=Depends(get_current_user)):
     return {"ok": True, "updated": updated, "dispatched": dispatched}
 
 
+async def _dispatch_event(kind: str, payload: dict):
+    return await sm_plugins.dispatch(db, kind, payload)
+
+
+async def _nvd_sync_job() -> dict:
+    return await nvd.sync(db, _dispatch_event)
+
+
+@api.post("/cves/sync")
+async def sync_cves(_user=Depends(get_current_user)):
+    state = await db.meta.find_one({"key": "nvd_sync"}, {"_id": 0})
+    if state and state.get("status") == "running":
+        return {"ok": True, "started": False, "reason": "sync already running"}
+    asyncio.create_task(_nvd_sync_job())
+    return {"ok": True, "started": True}
+
+
+@api.get("/cves/sync-status")
+async def cve_sync_status(_user=Depends(get_current_user)):
+    state = await db.meta.find_one({"key": "nvd_sync"}, {"_id": 0}) or {"status": "never"}
+    tools = set()
+    async for ws in db.workstations.find({}, {"_id": 0, "tools": 1}):
+        tools.update(t.get("name") for t in ws.get("tools") or [] if isinstance(t, dict) and t.get("name"))
+    state["fleet_tools"] = sorted(tools)
+    state["api_key_configured"] = bool(os.environ.get("NVD_API_KEY"))
+    return state
+
+
 # ============================================================
 # RELEASES
 # ============================================================
@@ -346,6 +501,22 @@ async def rescan_cves(_user=Depends(get_current_user)):
 async def list_releases(_user=Depends(get_current_user)):
     docs = await db.releases.find({}, {"_id": 0}).sort("published_at", -1).to_list(200)
     return docs
+
+
+@api.get("/releases/status")
+async def releases_status(_user=Depends(get_current_user)):
+    state = await db.meta.find_one({"key": "releases_sync"}, {"_id": 0}) or {"status": "never"}
+    state["repo"] = releases_sync.repo_name()
+    return state
+
+
+@api.post("/releases/sync")
+async def sync_releases_now(_user=Depends(get_current_user)):
+    try:
+        result = await releases_sync.sync_releases(db)
+    except Exception as e:
+        raise HTTPException(502, f"GitHub sync failed: {e}")
+    return {"ok": True, **result}
 
 
 # ============================================================
@@ -369,12 +540,14 @@ async def stats_overview(_user=Depends(get_current_user)):
     latest_release = await db.releases.find_one({}, {"_id": 0}, sort=[("published_at", -1)])
     return {
         "fleet_total": len(workstations),
+        "real_total": sum(1 for w in workstations if not w.get("demo")),
         "by_profile": by_profile,
         "by_os": by_os,
         "by_status": by_status,
         "cve_total": len(cves),
         "cve_by_severity": cve_sev,
         "latest_release": latest_release,
+        "demo": await _demo_counts(),
     }
 
 
@@ -1031,12 +1204,28 @@ async def _run_scheduled_bulk_sweep(job: dict) -> dict:
     return {"scope": scope, "hosts_swept": hosts, "total_lookups": total}
 
 
+async def _run_schedule(job: dict) -> dict:
+    kind = job.get("kind", "bulk_sweep")
+    if kind == "nvd_sync":
+        return await _nvd_sync_job()
+    if kind == "releases_sync":
+        return await releases_sync.sync_releases(db)
+    return await _run_scheduled_bulk_sweep(job)
+
+
 @api.post("/schedules/{sched_id}/run-now")
 async def run_schedule_now(sched_id: str, _user=Depends(get_current_user)):
     job = await db.schedules.find_one({"id": sched_id})
     if not job:
         raise HTTPException(404, "Schedule not found")
-    result = await _run_scheduled_bulk_sweep(job)
+    try:
+        result = await _run_schedule(job)
+    except Exception as e:
+        await db.schedules.update_one({"id": sched_id}, {"$set": {
+            "last_run_at": _now(), "last_run_status": "error",
+            "last_run_meta": {"error": f"{e.__class__.__name__}: {e}"[:400]},
+        }})
+        raise HTTPException(502, f"run failed: {e}")
     await db.schedules.update_one({"id": sched_id}, {"$set": {
         "last_run_at": _now(), "last_run_status": "ok", "last_run_meta": result,
     }})
@@ -1270,6 +1459,11 @@ async def startup():
     await db.schedules.create_index("id", unique=True)
     await db.sigma_sources.create_index("id", unique=True)
     await db.marketplace_subscriptions.create_index("id", unique=True)
+    await db.meta.create_index("key", unique=True)
+    await db.cves.create_index("source")
+    # A sync interrupted by a restart must not stay "running" forever.
+    await db.meta.update_many({"key": {"$in": ["nvd_sync", "releases_sync"]}, "status": "running"},
+                              {"$set": {"status": "interrupted", "finished_at": _now()}})
 
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@secmaster.io").lower()
     admin_pw = os.environ.get("ADMIN_PASSWORD", "admin1234")
@@ -1284,7 +1478,7 @@ async def startup():
         await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_password(admin_pw)}})
         log.info("Updated admin password from env")
 
-    if await db.workstations.count_documents({}) == 0:
+    if not await db.meta.find_one({"key": "demo_purged"}) and await db.workstations.count_documents({}) == 0:
         workstations = seedmod.build_workstations()
         await db.workstations.insert_many(workstations)
         cves = seedmod.build_cves(workstations)
@@ -1294,13 +1488,30 @@ async def startup():
         audit = seedmod.build_audit(workstations)
         if audit:
             await db.audit.insert_many(audit)
-        log.info("Seeded fleet: %d workstations, %d CVEs, %d releases",
+        log.info("Seeded DEMO fleet: %d workstations, %d CVEs, %d releases",
                  len(workstations), len(cves), len(releases))
+
+    # Flag legacy seed docs (created before the demo marker existed).
+    await db.workstations.update_many({"hostname": {"$in": [h for h, _ in seedmod.HOSTNAMES]}, "demo": {"$exists": False}}, {"$set": {"demo": True}})
+    await db.cves.update_many({"cve_id": {"$in": [c[0] for c in seedmod.CVE_SEEDS]}, "demo": {"$exists": False}}, {"$set": {"demo": True}})
+    await db.releases.update_many({"version": {"$in": [r[0] for r in seedmod.RELEASES]}, "source": {"$exists": False}, "demo": {"$exists": False}}, {"$set": {"demo": True}})
+    demo_ids = [w["id"] async for w in db.workstations.find({"demo": True}, {"id": 1})]
+    if demo_ids:
+        await db.audit.update_many({"workstation_id": {"$in": demo_ids}, "demo": {"$exists": False}}, {"$set": {"demo": True}})
+
+    # Built-in daily jobs: NVD CVE sync + GitHub release sync (visible/editable under Automations).
+    for kind, name in (("nvd_sync", "daily NVD CVE sync"), ("releases_sync", "daily GitHub release sync")):
+        if not await db.schedules.find_one({"kind": kind}):
+            await db.schedules.insert_one({
+                "id": secrets.token_hex(10), "kind": kind, "name": name, "enabled": True,
+                "interval_hours": 24, "scope": "all", "created_by": "system", "created_at": _now(),
+                "last_run_at": None, "last_run_status": None, "builtin": True,
+            })
 
     # Bootstrap marketplace signing config so /api/marketplace/feed is ready.
     await marketplace.get_or_create_config(db)
 
-    # Kick off the background scheduler (bulk sweeps + sigma sync + marketplace pulls).
+    # Kick off the background scheduler (bulk sweeps + sigma sync + marketplace pulls + NVD/GitHub syncs).
     async def _sync_marketplace(job: dict) -> dict:
         return await marketplace.verify_and_import_subscription(db, job)
 
@@ -1309,11 +1520,12 @@ async def startup():
 
     asyncio.create_task(sm_scheduler.run_scheduler(
         db,
-        run_bulk_sweep=_run_scheduled_bulk_sweep,
+        run_bulk_sweep=_run_schedule,
         run_sigma_sync=_sync_sigma,
         run_marketplace_sync=_sync_marketplace,
     ))
-    log.info("Background scheduler task spawned")
+    asyncio.create_task(fleet_status.status_loop(db))
+    log.info("Background scheduler + status loop spawned")
 
 
 @app.on_event("shutdown")

@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { api } from "@/lib/api";
 import { ENROLL } from "@/constants/testIds";
 import { useCli } from "@/components/Layout";
-import { Copy, Terminal, Loader2 } from "lucide-react";
+import { Copy, Terminal, Loader2, Download } from "lucide-react";
 import { toast } from "sonner";
 
 export default function EnrollWorkstation() {
@@ -114,13 +114,38 @@ export default function EnrollWorkstation() {
           <button onClick={() => openCli({
             title: "Enroll workstation into fleet",
             command: os === "nixos" ? tok.bash_command : tok.powershell_command,
-            description: "Bootstraps agent, exchanges the one-time token for a persistent bearer, and posts the first heartbeat.",
+            description: "Downloads agent.py from this dashboard, exchanges the one-time token for a persistent bearer, installs a systemd unit (Linux) / Scheduled Task (Windows) that heartbeats every 60s and applies profile switches requested here.",
             shell: os === "nixos" ? "bash" : "powershell",
           })} className="flex items-center gap-1.5 px-3 py-1.5 border rounded-sm text-xs font-mono hover:bg-[#292e42]" style={{ borderColor: "var(--border-subtle)" }}>
             <Terminal size={12} /> open in cli-mirror
           </button>
         </div>
       )}
+
+      <div data-testid="enroll-how-it-works" className="border rounded-sm p-4 space-y-3 font-mono text-xs" style={{ background: "var(--bg-card)", borderColor: "var(--border-subtle)" }}>
+        <div className="text-[10px] uppercase tracking-widest text-[#565f89]">what the one-liner does on the host</div>
+        <ol className="list-decimal list-inside space-y-1 text-[#a9b1d6]">
+          <li>fetches <span className="text-[#c0caf5]">agent.py</span> from this dashboard into <span className="text-[#c0caf5]">/opt/sec-master</span> (Linux) or <span className="text-[#c0caf5]">%ProgramData%\SecMaster</span> (Windows)</li>
+          <li>POSTs the one-time token to <span className="text-[#c0caf5]">/api/agent/enroll</span> → stores the agent bearer with mode 0600</li>
+          <li>installs <span className="text-[#c0caf5]">sec-master-agent</span> (systemd / transient unit on NixOS / Scheduled Task on Windows) heartbeating every 60s with detected tool versions, flake/DSC hash, local IP</li>
+          <li>when you switch a profile here, the agent runs <span className="text-[#c0caf5]">nixos-rebuild switch --specialisation &lt;p&gt;</span> or <span className="text-[#c0caf5]">Set-SMProfile</span> and reports back — status shows <span style={{ color: "var(--status-drift)" }}>drift</span> until applied; <span style={{ color: "var(--status-offline)" }}>offline</span> after 5 min without heartbeat</li>
+        </ol>
+        <div className="text-[10px] uppercase tracking-widest text-[#565f89] pt-1">artifacts served by this dashboard</div>
+        <div className="flex flex-wrap gap-2">
+          {[["agent.py", "/api/agent/agent.py"], ["bootstrap.sh", "/api/agent/bootstrap.sh"], ["bootstrap.ps1", "/api/agent/bootstrap.ps1"], ["SecurityMaster.psm1", "/api/agent/SecurityMaster.psm1"], ["sec-master (cli)", "/api/agent/sec-master"]].map(([label, path]) => (
+            <a key={path} data-testid={`enroll-artifact-${label.split(" ")[0]}`} href={`${process.env.REACT_APP_BACKEND_URL}${path}`} target="_blank" rel="noreferrer"
+              className="flex items-center gap-1 px-2 py-1 border rounded-sm hover:bg-[#292e42] text-[#a9b1d6]" style={{ borderColor: "var(--border-subtle)" }}>
+              <Download size={10} /> {label}
+            </a>
+          ))}
+        </div>
+        <pre className="p-3 border rounded-sm whitespace-pre-wrap" style={{ borderColor: "var(--border-subtle)", background: "var(--bg-terminal)", color: "var(--text-secondary)" }}>
+{`# install the operator CLI
+$ curl -fsSL ${process.env.REACT_APP_BACKEND_URL}/api/agent/sec-master -o /usr/local/bin/sec-master && chmod +x /usr/local/bin/sec-master
+$ sec-master login --dashboard ${process.env.REACT_APP_BACKEND_URL} --email <you>
+$ sec-master fleet list`}
+        </pre>
+      </div>
     </div>
   );
 }

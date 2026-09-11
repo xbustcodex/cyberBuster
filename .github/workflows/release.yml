@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build bundle
+        run: |
+          set -euo pipefail
+          BUNDLE="sec-master-${GITHUB_REF_NAME}.tar.gz"
+          tar -czf "$BUNDLE" infrastructure README.md
+          sha256sum "$BUNDLE" > "$BUNDLE.sha256"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign bundle (keyless via GitHub OIDC)
+        run: |
+          set -euo pipefail
+          BUNDLE="sec-master-${GITHUB_REF_NAME}.tar.gz"
+          cosign sign-blob --yes --bundle "$BUNDLE.bundle" "$BUNDLE"
+          cosign verify-blob --bundle "$BUNDLE.bundle" \
+            --certificate-identity-regexp "https://github.com/${GITHUB_REPOSITORY}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$BUNDLE"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+          files: |
+            sec-master-*.tar.gz
+            sec-master-*.tar.gz.sha256
+            sec-master-*.tar.gz.bundle

@@ -94,6 +94,7 @@ def build_workstations() -> list[dict]:
             "last_heartbeat": _iso_days_ago(0) if statuses[i % 5] != "offline" else _iso_days_ago(random.randint(2, 14)),
             "status": statuses[i % 5],
             "ip_address": f"10.13.{random.randint(1,254)}.{random.randint(1,254)}",
+            "demo": True,
         })
     return out
 
@@ -109,6 +110,7 @@ def build_releases() -> list[dict]:
             "published_at": _iso_days_ago(days_ago),
             "changelog": changelog,
             "channel": channel,
+            "demo": True,
         }
         for v, channel, days_ago, changelog, signer in RELEASES
     ]
@@ -134,6 +136,7 @@ def build_cves(workstations: list[dict]) -> list[dict]:
             "affected_versions": versions,
             "remediation": remediation,
             "matched_workstations": matched,
+            "demo": True,
         })
     return out
 
@@ -158,5 +161,6 @@ def build_audit(workstations: list[dict]) -> list[dict]:
                 "message": msg,
                 "at": _iso_days_ago(random.randint(0, 20)),
                 "meta": {},
+                "demo": True,
             })
     return events

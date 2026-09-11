@@ -2,8 +2,9 @@ import { useState, useEffect, createContext, useContext } from "react";
 import { NavLink, useNavigate, useLocation } from "react-router-dom";
 import {
   Server, ShieldAlert, Layers, Rocket, KeyRound, Plug, FileCode, Clock,
-  Terminal, LogOut, Activity, Search,
+  Terminal, LogOut, Activity, Search, AlertTriangle,
 } from "lucide-react";
+import { toast } from "sonner";
 import { useAuth } from "@/context/AuthContext";
 import { NAV, AUTH, CLI } from "@/constants/testIds";
 import { CliDrawer } from "@/components/CliDrawer";
@@ -32,6 +33,18 @@ export function Layout({ children }) {
 
   const openCli = (payload) => setCliState({ open: true, ...payload });
   const closeCli = () => setCliState((s) => ({ ...s, open: false }));
+  const [purging, setPurging] = useState(false);
+
+  const purgeDemo = async () => {
+    const d = health.demo || {};
+    if (!window.confirm(`Delete ${d.workstations} demo workstations, ${d.cves} demo CVEs and ${d.releases} demo releases? Real enrolled hosts are kept.`)) return;
+    setPurging(true);
+    try {
+      await api.delete("/demo-data");
+      toast.success("demo data purged — fleet now shows only real hosts");
+      window.location.reload();
+    } catch { toast.error("purge failed"); setPurging(false); }
+  };
 
   useEffect(() => {
     let mounted = true;
@@ -91,6 +104,29 @@ export function Layout({ children }) {
               </button>
             </div>
           </div>
+          {health.demo?.workstations > 0 && (
+            <div
+              data-testid="demo-banner"
+              className="flex flex-wrap items-center justify-between gap-2 px-4 py-1.5 border-t text-[11px] font-mono"
+              style={{ background: "rgba(224,175,104,0.10)", borderColor: "rgba(224,175,104,0.35)", color: "var(--status-drift)" }}
+            >
+              <span className="flex items-center gap-2">
+                <AlertTriangle size={12} />
+                <span className="uppercase tracking-widest font-semibold">demo data</span>
+                <span className="text-[#a9b1d6]">
+                  {health.demo.workstations} sample workstations · {health.demo.cves} sample CVEs · {health.demo.releases} sample releases are fabricated.
+                  Real hosts enrolled via <span className="text-[#c0caf5]">enroll-workstation</span> are unaffected ({health.real_total ?? 0} real).
+                </span>
+              </span>
+              <button
+                data-testid="demo-purge-btn"
+                onClick={purgeDemo}
+                disabled={purging}
+                className="px-2 py-0.5 border rounded-sm uppercase tracking-widest text-[10px] hover:bg-[#292e42] disabled:opacity-60"
+                style={{ borderColor: "var(--status-drift)", color: "var(--status-drift)" }}
+              >{purging ? "purging…" : "purge demo data"}</button>
+            </div>
+          )}
         </div>
 
         <div className="flex">

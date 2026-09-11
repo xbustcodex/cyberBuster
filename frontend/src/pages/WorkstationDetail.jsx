@@ -35,9 +35,14 @@ export default function WorkstationDetail() {
   const pm = PROFILE_META[ws.profile];
 
   const switchTo = async (p) => {
-    try { await api.post(`/workstations/${id}/switch-profile`, { profile: p }); toast.success(`switched to ${p}`); load(); }
-    catch { toast.error("switch failed"); }
+    try {
+      const { data } = await api.post(`/workstations/${id}/switch-profile`, { profile: p });
+      toast.success(data.pending ? `switch to ${p} requested — agent applies on next heartbeat` : `switched to ${p}`);
+      load();
+    } catch { toast.error("switch failed"); }
   };
+
+  const pending = ws.desired_profile && ws.desired_profile !== ws.profile;
 
   const destroy = async () => {
     if (!confirm(`Deregister ${ws.hostname}?`)) return;
@@ -55,16 +60,31 @@ export default function WorkstationDetail() {
         <div className="flex flex-wrap items-center gap-3 justify-between">
           <div>
             <div className="text-[10px] font-mono uppercase tracking-widest text-[#565f89] mb-1">// workstation</div>
-            <h1 data-testid={WS.hostname} className="font-mono text-2xl text-[#c0caf5]">{ws.hostname}<span className="cursor" /></h1>
+            <h1 data-testid={WS.hostname} className="font-mono text-2xl text-[#c0caf5]">
+              {ws.hostname}<span className="cursor" />
+              {ws.demo && <span data-testid="ws-demo-tag" className="ml-3 align-middle px-1.5 py-0.5 text-[9px] uppercase tracking-widest border rounded-sm" style={{ color: "var(--status-drift)", borderColor: "var(--status-drift)" }}>demo data</span>}
+            </h1>
             <div className="mt-1 flex flex-wrap gap-2 text-[10px] font-mono text-[#a9b1d6]">
               <span>{ws.ip_address}</span>
+              {ws.local_ip && ws.local_ip !== ws.ip_address && <><span>·</span><span>lan {ws.local_ip}</span></>}
               <span>·</span>
               <span>{ws.os === "nixos" ? "nixos-flake" : "windows-dsc"}</span>
+              {ws.os_release && <><span>·</span><span className="truncate max-w-[260px]">{ws.os_release}</span></>}
               <span>·</span>
               <span>agent v{ws.agent_version}</span>
               <span>·</span>
               <span>{ws.status}</span>
             </div>
+            {pending && (
+              <div data-testid="ws-pending-profile" className="mt-2 text-[10px] font-mono uppercase tracking-widest" style={{ color: "var(--status-drift)" }}>
+                → switch to {ws.desired_profile} pending · requested by {ws.desired_profile_requested_by || "operator"} · agent applies on next heartbeat
+              </div>
+            )}
+            {ws.last_apply_error && (
+              <div data-testid="ws-apply-error" className="mt-1 text-[10px] font-mono" style={{ color: "var(--sev-high)" }}>
+                agent apply error: {ws.last_apply_error.message}
+              </div>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <span
@@ -82,10 +102,10 @@ export default function WorkstationDetail() {
             </div>
             <button onClick={() => openCli({
               title: `Switch profile on ${ws.hostname}`,
-              command: ws.os === "nixos"
-                ? `ssh ${ws.hostname} 'nixos-rebuild switch --specialisation offense --flake github:sec-master/flake'`
-                : `Invoke-Command -ComputerName ${ws.hostname} -ScriptBlock { Set-SMProfile offense }`,
-              description: "Atomic profile switch. On NixOS this reboots into the specialisation. On Windows it applies the DSC config set.",
+              command: `sec-master fleet switch ${ws.hostname} offense\n# the agent then runs on the host:\n${ws.os === "nixos"
+                ? "nixos-rebuild switch --specialisation offense"
+                : "Import-Module C:\\ProgramData\\SecMaster\\SecurityMaster.psm1; Set-SMProfile -Profile offense"}`,
+              description: "Marks the desired profile on the dashboard; the enrolled agent picks it up on its next heartbeat and applies it locally, then reports back.",
             })} className="p-1.5 border rounded-sm hover:bg-[#292e42]" style={{ borderColor: "var(--border-subtle)" }}>
               <Terminal size={12} />
             </button>
@@ -127,19 +147,26 @@ export default function WorkstationDetail() {
                   <tr className="text-left uppercase text-[10px] tracking-widest text-[#565f89] border-b" style={{ borderColor: "var(--border-subtle)" }}>
                     <th className="px-4 py-2">tool</th>
                     <th className="px-4 py-2">version</th>
-                    <th className="px-4 py-2">expected</th>
+                    <th className="px-4 py-2">path</th>
                     <th className="px-4 py-2">status</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {(ws.tools || []).map((t, i) => (
-                    <tr key={i} className="row-hover border-b" style={{ borderColor: "var(--border-subtle)" }}>
-                      <td className="px-4 py-2 text-[#c0caf5]">{t.name}</td>
-                      <td className="px-4 py-2 text-[#a9b1d6]">{t.version}</td>
-                      <td className="px-4 py-2 text-[#565f89]">{t.version}</td>
-                      <td className="px-4 py-2"><span className="dot" style={{ color: "var(--status-online)", background: "var(--status-online)" }} /> <span className="text-[10px] uppercase tracking-widest text-[#9ece6a]">pinned</span></td>
-                    </tr>
-                  ))}
+                  {(ws.tools || []).length === 0 && (
+                    <tr><td colSpan={4} className="px-4 py-6 text-center text-[10px] text-[#565f89]">agent has not reported any tools yet</td></tr>
+                  )}
+                  {(ws.tools || []).map((t, i) => {
+                    const known = t.version && t.version !== "unknown";
+                    const col = known ? "var(--status-online)" : "var(--status-drift)";
+                    return (
+                      <tr key={i} className="row-hover border-b" style={{ borderColor: "var(--border-subtle)" }}>
+                        <td className="px-4 py-2 text-[#c0caf5]">{t.name}</td>
+                        <td className="px-4 py-2 text-[#a9b1d6]">{t.version}</td>
+                        <td className="px-4 py-2 text-[#565f89] truncate max-w-[260px]">{t.path || "—"}</td>
+                        <td className="px-4 py-2"><span className="dot" style={{ color: col, background: col }} /> <span className="text-[10px] uppercase tracking-widest" style={{ color: col }}>{ws.demo ? "sample" : known ? "detected" : "version unknown"}</span></td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

@@ -16,6 +16,7 @@ export default function CveAlerts() {
   const [rows, setRows] = useState([]);
   const [sev, setSev] = useState("all");
   const [expanded, setExpanded] = useState(null);
+  const [sync, setSync] = useState(null);
   const { openCli } = useCli();
 
   const load = async () => {
@@ -24,13 +25,37 @@ export default function CveAlerts() {
       setRows(data);
     } catch { toast.error("CVE load failed"); }
   };
+  const loadSync = async () => {
+    try { const { data } = await api.get("/cves/sync-status"); setSync(data); return data; }
+    catch { return null; }
+  };
 
   useEffect(() => { load(); /* eslint-disable-next-line */ }, [sev]);
+  useEffect(() => { loadSync(); }, []);
+  useEffect(() => {
+    if (sync?.status !== "running") return;
+    const t = setInterval(async () => {
+      const s = await loadSync();
+      if (s && s.status !== "running") { load(); toast.success(`NVD sync done · ${s.result?.cves_stored ?? 0} advisories · ${s.result?.fleet_affected ?? 0} affect the fleet`); }
+    }, 4000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line
+  }, [sync?.status]);
 
   const rescan = async () => {
     try { await api.post("/cves/rescan"); toast.success("Fleet rescanned against CVE database"); load(); }
     catch { toast.error("rescan failed"); }
   };
+
+  const syncNvd = async () => {
+    try {
+      const { data } = await api.post("/cves/sync");
+      toast[data.started ? "success" : "info"](data.started ? "NVD sync started" : data.reason);
+      setSync((s) => ({ ...(s || {}), status: "running" }));
+    } catch { toast.error("sync failed"); }
+  };
+
+  const fleetAffected = rows.filter((c) => c.matched_workstations > 0).length;
 
   return (
     <div className="space-y-4">
@@ -38,16 +63,25 @@ export default function CveAlerts() {
         <div>
           <div className="text-[10px] font-mono uppercase tracking-widest text-[#565f89] mb-1">// vulnerabilities</div>
           <h1 className="font-mono text-2xl sm:text-3xl tracking-tight text-[#c0caf5]">cve-alerts<span className="cursor" /></h1>
-          <p className="text-xs text-[#a9b1d6] mt-1">{rows.length} advisories matched against installed tool versions</p>
+          <p className="text-xs text-[#a9b1d6] mt-1">
+            {rows.length} advisories · <span style={{ color: fleetAffected ? "var(--sev-high)" : "var(--status-online)" }}>{fleetAffected} affect installed tool versions</span>
+          </p>
+          <p data-testid="cve-sync-status" className="text-[10px] font-mono text-[#565f89] mt-1">
+            nvd sync: {sync?.status === "running" ? <span style={{ color: "var(--status-drift)" }}>running…</span> : sync?.status === "ok" ? `ok · ${new Date(sync.finished_at).toISOString().replace("T", " ").slice(0, 19)} · ${sync.result?.tools_queried} tools queried` : sync?.status === "error" ? <span style={{ color: "var(--sev-high)" }}>error · {sync.error}</span> : "never"}
+            {sync && ` · api-key ${sync.api_key_configured ? "on" : "off"}`}
+          </p>
         </div>
         <div className="flex gap-2">
+          <button data-testid="cve-sync-nvd-btn" onClick={syncNvd} disabled={sync?.status === "running"} className="flex items-center gap-1.5 px-3 py-1.5 border rounded-sm text-xs font-mono hover:bg-[#292e42] disabled:opacity-60" style={{ borderColor: "var(--border-accent)" }}>
+            <RefreshCw size={12} className={sync?.status === "running" ? "animate-spin" : ""} /> sync nvd
+          </button>
           <button onClick={rescan} className="flex items-center gap-1.5 px-3 py-1.5 border rounded-sm text-xs font-mono hover:bg-[#292e42]" style={{ borderColor: "var(--border-subtle)" }}>
             <RefreshCw size={12} /> rescan fleet
           </button>
           <button onClick={() => openCli({
             title: "CVE feed sync + fleet match",
-            command: "sec-master cve sync --source nvd && sec-master cve match --fleet all",
-            description: "Pulls latest NVD advisories, then matches CVEs against tool versions installed on every enrolled workstation.",
+            command: "sec-master cve sync && sec-master cve status\nsec-master cve list --severity high",
+            description: "Queries NVD (cpe:2.3:a:*:<tool>) for every tool the agents report, matches CPE version ranges against installed versions, then stores advisories with per-host match counts.",
           })} className="flex items-center gap-1.5 px-3 py-1.5 border rounded-sm text-xs font-mono hover:bg-[#292e42]" style={{ borderColor: "var(--border-subtle)" }}>
             <Terminal size={12} /> cli
           </button>
@@ -93,7 +127,10 @@ export default function CveAlerts() {
               return (
                 <>
                   <tr key={c.id} data-testid={CVE.row} className="row-hover border-b" style={{ borderColor: "var(--border-subtle)" }}>
-                    <td className="px-3 py-2 text-[#c0caf5]">{c.cve_id}</td>
+                    <td className="px-3 py-2 text-[#c0caf5]">
+                      {c.url ? <a href={c.url} target="_blank" rel="noreferrer" className="hover:text-[#7aa2f7] underline-offset-4 hover:underline">{c.cve_id}</a> : c.cve_id}
+                      {c.demo && <span className="ml-1.5 px-1 py-px text-[9px] uppercase tracking-widest border rounded-sm" style={{ color: "var(--status-drift)", borderColor: "var(--status-drift)" }}>demo</span>}
+                    </td>
                     <td className="px-3 py-2">
                       <span className="px-1.5 py-0.5 text-[10px] uppercase tracking-widest border rounded-sm" style={{ color: m.color, borderColor: m.color, background: m.bg }}>
                         {c.severity}
@@ -129,7 +166,9 @@ export default function CveAlerts() {
 {`$ ${c.remediation}`}
                         </pre>
                         <div className="mt-2 text-[11px] font-mono text-[#a9b1d6] leading-relaxed">
-                          Affected versions: <span className="text-[#c0caf5]">{c.affected_versions.join(", ")}</span>
+                          {c.affected_range && <>Affected range: <span className="text-[#c0caf5]">{c.affected_range}</span> · </>}
+                          Fleet versions hit: <span className="text-[#c0caf5]">{c.affected_versions?.length ? c.affected_versions.join(", ") : "none"}</span>
+                          {c.source === "nvd" && <span className="text-[#565f89]"> · source NVD</span>}
                         </div>
                       </td>
                     </tr>

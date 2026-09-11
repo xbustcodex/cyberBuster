@@ -1,0 +1,48 @@
+{
+  "summary": "Backend + frontend testing for Security Master 'real app' iteration. 25/27 pytest cases pass (92.6%). Real agent enroll→heartbeat→profile-switch→apply flow works end-to-end. NVD sync (412 CVEs), GitHub releases sync (0 releases for xbustcodex/cyberBuster), demo banner, artifact endpoints, offline engine, schedules, heartbeat auth & apply_error all verified. Two real bugs found: (1) /api/cves/rescan → 500 AttributeError because one seed workstation has string tools; (2) CLI login blocked by Cloudflare 1010 (default urllib UA). Frontend: every requested data-testid renders correctly. Note: minor React 'unique key' warning on CveAlerts page.",
+  "backend_issues": {
+    "critical": [
+      {"endpoint": "/api/cves/rescan", "issue": "500 AttributeError: 'str' object has no attribute 'get' at server.py:451. Workstation 'testbox-01' has tools stored as bare strings (e.g. 'nmap') instead of dicts, and the rescan loop calls t.get(...) unconditionally. Fix: skip non-dict entries or coerce (`if not isinstance(t, dict): continue`). Blocks the whole CVE→fleet correlation rescan.", "priority": "HIGH"}
+    ],
+    "minor": [
+      {"endpoint": "CLI /infrastructure/cli/sec-master (login)", "issue": "cmd_login uses urllib.request.Request without a custom User-Agent, so Python-urllib/3.11 is sent. The Cloudflare edge in front of the preview URL returns HTTP 403 (error code 1010 — 'The owner of this website has banned your access based on your browser signature'). Every other CLI call goes through request() which does set UA='sec-master-cli/1.0' (that UA is accepted). Fix: pass headers={'Content-Type':'application/json','User-Agent':'sec-master-cli/1.0'} to the Request in cmd_login."},
+      {"endpoint": "GET /api/stats/overview", "issue": "Response uses 'workstations' key inside 'demo' (as documented) but does not expose per-severity CVE demo counts nor the timestamp of last purge — only 'purged' as a bool. Nice-to-have."},
+      {"endpoint": "GET /api/cves/sync-status", "issue": "Field 'status' can be 'running' for very long stretches; there is no last_completed timestamp separate from status. Currently returns 412 CVEs but if a run is in progress a client can't distinguish 'running-fresh' vs 'stuck'."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "CveAlerts", "issue": "React warning: 'Each child in a list should have a unique \"key\" prop.' in the render method — one of the lists (probably the sync-status pill or matched-workstations row) is missing key= on iteration.", "selector": "page /cve-alerts", "priority": "LOW"}
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_real_app.py",
+    "/app/test_reports/pytest/real_app.xml"
+  ],
+  "action_items": [
+    "server.py rescan_cves (~line 451): guard against non-dict tool entries — `for t in ws.get('tools', []): if not isinstance(t, dict): continue; ...`. Also consider a one-off migration to normalize legacy string tools on 'testbox-01'.",
+    "infrastructure/cli/sec-master cmd_login: add `User-Agent: sec-master-cli/1.0` header on the Request; otherwise Cloudflare blocks stdlib urllib. All other CLI calls already set UA via request().",
+    "CveAlerts.jsx: add a stable key prop to whichever list is being iterated (React warning present in browser console)."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now ~1545 lines (up from 1016). Splitting into routers (auth/fleet/cve/releases/plugins/schedules/agent) is overdue — the >700-line rule is broken 2x.",
+    "rescan_cves lacks defensive typing on nested tool docs; the same pattern (t.get('name'), t.get('version')) appears in seed & sync paths. Introduce a helper `normalize_tools(list) -> list[dict]` and call it on every ingest (heartbeat, seed, sigma-import) so downstream code can trust the shape.",
+    "purge_demo_data (server.py:237) uses `async for w in db.workstations.find(...)` to collect ids, then a separate `find({'source':'nvd'})` loop that runs N update_one calls to fix matched_workstations counts. This can be a single aggregation or `bulk_write`. For 400+ CVEs it's OK; at 10k it will stall.",
+    "cve_sync_status.status can stay 'running' if a task crashes because state is written in nvd.sync's success path only. Wrap the task in try/finally that always writes an 'error'/'done' status."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_real_app.py (new — 27 tests covering all new 'real app' features)"
+  ],
+  "success_rate": {"backend": "92.6% (25/27)", "frontend": "100% (all requested testids present, 1 React key warning)"},
+  "test_credentials": "admin@secmaster.io / admin1234 (from /app/memory/test_credentials.md, verified working)",
+  "seed_data_creation": "Test creates ephemeral hosts (qa-agent-01 via real agent + TEST_apperr_*, TEST_realapp_*) and cleans them up at end of run. State dir /tmp/smtest_realapp is wiped in test_zz_cleanup. Existing seed demo data left intact (NOT purged per instructions).",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "test_real_app.py uses xdist (2 workers via pytest.ini). Tests are ordered — test_real_agent_enroll_and_heartbeat MUST run before test_switch_profile_real_host_pending and test_agent_applies_pending_switch (all under gw0 by load-scope). Offline-engine test mutates Mongo directly via /app/backend/.env MONGO_URL, then waits up to 40s for the 30s fleet_status loop. CLI test currently fails due to Cloudflare 1010 — will pass once User-Agent header is added to cmd_login. CVE rescan test will pass once rescan_cves handles non-dict tool entries or after testbox-01 is deleted/normalized.",
+  "rca of the issue": {
+    "cves_rescan_500": "One legacy workstation 'testbox-01' has `tools: ['nmap', ...]` (list of strings, not list of {name,version} dicts). The rescan loop at server.py:451 does `t.get('name')` which raises AttributeError on strings, bubbling up as HTTP 500. Reproduction: `curl -X POST $URL/api/cves/rescan -H 'Authorization: Bearer <admin>'` → 500. Mitigation: add `if not isinstance(t, dict): continue` before the .get() call, and optionally run a one-off `db.workstations.update_one({'hostname':'testbox-01'}, {'$set':{'tools':[]}})` to clean stale data.",
+    "cli_login_403": "CLI's cmd_login builds urllib.request.Request without overriding User-Agent, so Python's stdlib sends `User-Agent: Python-urllib/3.11`. Cloudflare in front of the preview URL flags that UA as bot traffic and returns 403 error code 1010. All other CLI commands go through request() which sets UA='sec-master-cli/1.0' and works fine. Fix is one line: add User-Agent to the Request headers dict at cli/sec-master line 94-96."
+  }
+}

@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""sec-master — CLI for the Security Master fleet dashboard (stdlib only).
+
+    sec-master login --dashboard https://dashboard --email admin@example.com
+    sec-master fleet list [--profile offense] [--status drift] [--json]
+    sec-master fleet show <hostname>
+    sec-master fleet switch <hostname> <offense|defense|analyst>
+    sec-master fleet forget <hostname>
+    sec-master cve list [--severity high] [--json]
+    sec-master cve sync | cve rescan
+    sec-master releases list | releases sync
+    sec-master enroll generate --hostname <h> --os <nixos|windows>
+    sec-master ioc sweep [--scope online|all]
+    sec-master demo purge
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "sec-master")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_FILE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+    os.chmod(CONFIG_FILE, 0o600)
+
+
+def request(method: str, path: str, body: dict | None = None, params: dict | None = None, auth: bool = True) -> object:
+    cfg = load_config()
+    base = os.environ.get("SM_DASHBOARD") or cfg.get("dashboard")
+    if not base:
+        sys.exit("not logged in — run: sec-master login --dashboard <url> --email <email>")
+    url = f"{base.rstrip('/')}/api{path}"
+    if params:
+        url += "?" + "&".join(f"{k}={urllib.request.quote(str(v))}" for k, v in params.items() if v is not None)
+    headers = {"Content-Type": "application/json", "User-Agent": "sec-master-cli/1.0"}
+    if auth:
+        token = os.environ.get("SM_TOKEN") or cfg.get("token")
+        if not token:
+            sys.exit("not logged in — run: sec-master login")
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read()).get("detail")
+        except Exception:
+            detail = e.reason
+        if e.code == 401:
+            sys.exit(f"unauthorized ({detail}) — run: sec-master login")
+        sys.exit(f"HTTP {e.code}: {detail}")
+
+
+def table(rows: list[dict], cols: list[str]) -> None:
+    if not rows:
+        print("(none)")
+        return
+    widths = {c: max(len(c), *(len(str(r.get(c, ""))) for r in rows)) for c in cols}
+    print("  ".join(c.upper().ljust(widths[c]) for c in cols))
+    for r in rows:
+        print("  ".join(str(r.get(c, "")).ljust(widths[c]) for c in cols))
+
+
+def find_ws(hostname: str) -> dict:
+    rows = request("GET", "/workstations", params={"q": hostname})
+    exact = [r for r in rows if r["hostname"] == hostname]
+    if not exact:
+        sys.exit(f"no workstation named {hostname!r}")
+    return exact[0]
+
+
+def cmd_login(a):
+    password = a.password or getpass.getpass("password: ")
+    req = urllib.request.Request(f"{a.dashboard.rstrip('/')}/api/auth/login",
+                                 data=json.dumps({"email": a.email, "password": password}).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        sys.exit(f"login failed: HTTP {e.code}")
+    save_config({"dashboard": a.dashboard, "token": data["access_token"], "email": a.email})
+    print(f"logged in as {a.email} → {a.dashboard} (config: {CONFIG_FILE})")
+
+
+def cmd_fleet(a):
+    if a.action == "list":
+        rows = request("GET", "/workstations", params={"profile": a.profile, "status": a.status})
+        if a.json:
+            print(json.dumps(rows, indent=2)); return
+        for r in rows:
+            r["tools"] = len(r.get("tools") or [])
+            r["heartbeat"] = (r.get("last_heartbeat") or "-")[:19]
+            r["pending"] = r.get("desired_profile") if r.get("desired_profile") not in (None, r.get("profile")) else ""
+            r["demo"] = "demo" if r.get("demo") else ""
+        table(rows, ["hostname", "os", "profile", "pending", "status", "tools", "heartbeat", "ip_address", "demo"])
+    elif a.action == "show":
+        ws = find_ws(a.hostname)
+        data = request("GET", f"/workstations/{ws['id']}")
+        print(json.dumps(data, indent=2))
+    elif a.action == "switch":
+        ws = find_ws(a.hostname)
+        r = request("POST", f"/workstations/{ws['id']}/switch-profile", {"profile": a.profile})
+        print(f"{a.hostname}: {r.get('message') or 'profile switch requested → ' + a.profile}")
+    elif a.action == "forget":
+        ws = find_ws(a.hostname)
+        request("DELETE", f"/workstations/{ws['id']}")
+        print(f"{a.hostname} deregistered")
+
+
+def cmd_cve(a):
+    if a.action == "list":
+        rows = request("GET", "/cves", params={"severity": a.severity})
+        if a.json:
+            print(json.dumps(rows, indent=2)); return
+        for r in rows:
+            r["matches"] = r.get("matched_workstations", 0)
+            r["published"] = (r.get("published") or "")[:10]
+            r["source"] = r.get("source") or ("demo" if r.get("demo") else "")
+            r["summary"] = (r.get("summary") or "")[:70]
+        table(rows, ["cve_id", "severity", "cvss", "affected_tool", "matches", "published", "source", "summary"])
+    elif a.action == "sync":
+        print(json.dumps(request("POST", "/cves/sync"), indent=2))
+    elif a.action == "status":
+        print(json.dumps(request("GET", "/cves/sync-status"), indent=2))
+    elif a.action == "rescan":
+        print(json.dumps(request("POST", "/cves/rescan"), indent=2))
+
+
+def cmd_releases(a):
+    if a.action == "sync":
+        print(json.dumps(request("POST", "/releases/sync"), indent=2)); return
+    rows = request("GET", "/releases")
+    if a.json:
+        print(json.dumps(rows, indent=2)); return
+    for r in rows:
+        r["sha"] = (r.get("commit_sha") or "")[:12]
+        r["published"] = (r.get("published_at") or "")[:10]
+        r["sig"] = r.get("signature_status")
+        r["source"] = r.get("source") or ("demo" if r.get("demo") else "")
+    table(rows, ["version", "channel", "sig", "signer", "sha", "published", "source"])
+
+
+def cmd_enroll(a):
+    r = request("POST", "/enroll/generate", {"hostname": a.hostname, "os": a.os})
+    print(f"token: {r['token']}  (expires {r['expires_at']})\n")
+    print("# bash / nixos\n" + r["bash_command"] + "\n")
+    print("# powershell\n" + r["powershell_command"])
+
+
+def cmd_ioc(a):
+    print(json.dumps(request("POST", "/ioc/bulk-sweep", {"scope": a.scope}), indent=2))
+
+
+def cmd_demo(a):
+    if a.action == "status":
+        print(json.dumps(request("GET", "/demo-data/status"), indent=2))
+    else:
+        print(json.dumps(request("DELETE", "/demo-data"), indent=2))
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="sec-master", description="Security Master fleet CLI")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("login"); s.add_argument("--dashboard", required=True); s.add_argument("--email", required=True)
+    s.add_argument("--password"); s.set_defaults(fn=cmd_login)
+
+    s = sub.add_parser("fleet"); fs = s.add_subparsers(dest="action", required=True)
+    x = fs.add_parser("list"); x.add_argument("--profile"); x.add_argument("--status"); x.add_argument("--json", action="store_true")
+    x = fs.add_parser("show"); x.add_argument("hostname")
+    x = fs.add_parser("switch"); x.add_argument("hostname"); x.add_argument("profile", choices=["offense", "defense", "analyst"])
+    x = fs.add_parser("forget"); x.add_argument("hostname")
+    s.set_defaults(fn=cmd_fleet)
+
+    s = sub.add_parser("cve"); cs = s.add_subparsers(dest="action", required=True)
+    x = cs.add_parser("list"); x.add_argument("--severity"); x.add_argument("--json", action="store_true")
+    cs.add_parser("sync"); cs.add_parser("status"); cs.add_parser("rescan")
+    s.set_defaults(fn=cmd_cve)
+
+    s = sub.add_parser("releases"); rs = s.add_subparsers(dest="action", required=True)
+    x = rs.add_parser("list"); x.add_argument("--json", action="store_true")
+    rs.add_parser("sync"); s.set_defaults(fn=cmd_releases)
+
+    s = sub.add_parser("enroll"); es = s.add_subparsers(dest="action", required=True)
+    x = es.add_parser("generate"); x.add_argument("--hostname", required=True); x.add_argument("--os", choices=["nixos", "windows"], default="nixos")
+    s.set_defaults(fn=cmd_enroll)
+
+    s = sub.add_parser("ioc"); ios = s.add_subparsers(dest="action", required=True)
+    x = ios.add_parser("sweep"); x.add_argument("--scope", choices=["online", "all"], default="online")
+    s.set_defaults(fn=cmd_ioc)
+
+    s = sub.add_parser("demo"); ds = s.add_subparsers(dest="action", required=True)
+    ds.add_parser("status"); ds.add_parser("purge"); s.set_defaults(fn=cmd_demo)
+
+    a = p.parse_args()
+    a.fn(a)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
